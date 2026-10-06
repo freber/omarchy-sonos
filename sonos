@@ -25,7 +25,8 @@ Python to start, polls every second while the popup is open, confirms a
 control about 250 ms after it lands and keeps the Spotify connection warm.
 Speakers on Wi-Fi sometimes drop the first packet of a connection and TCP
 waits a full second to retry, so every connection races a fresh attempt
-every 150 ms instead.
+every 150 ms instead. While the popup is open each speaker also has a
+connection opened in advance, so a click skips connecting altogether.
 """
 import base64
 import http.client
@@ -90,7 +91,46 @@ def connect(ip):
             s.close()
 
 
-def soap(ip, service, action, args="<InstanceID>0</InstanceID>"):
+# While the popup is open the helper keeps one connected socket per speaker, so
+# a click skips connecting. Speakers drop an unused connection after 5–15 s,
+# so spares are replaced before SPARE_AGE.
+SPARE_AGE = 6
+spares = {}  # ip -> (socket, opened at)
+spares_lock = threading.Lock()
+
+
+def take_spare(ip):
+    with spares_lock:
+        sock, opened = spares.pop(ip, (None, 0))
+    if sock and time.monotonic() - opened < SPARE_AGE:
+        return sock
+    if sock:
+        sock.close()
+    return None
+
+
+def add_spare(ip):
+    try:
+        sock = connect(ip)
+    except OSError:
+        return
+    with spares_lock:
+        old = spares.pop(ip, (None, 0))[0]
+        spares[ip] = (sock, time.monotonic())
+    if old:
+        old.close()
+
+
+def exchange(sock, request):
+    with sock:
+        sock.sendall(request)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def soap(ip, service, action, args="<InstanceID>0</InstanceID>", spare=False):
     body = (
         '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
         's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
@@ -102,12 +142,16 @@ def soap(ip, service, action, args="<InstanceID>0</InstanceID>"):
         f'Content-Type: text/xml; charset="utf-8"\r\nContent-Length: {len(body)}\r\n'
         f'SOAPACTION: "urn:schemas-upnp-org:service:{service}:1#{action}"\r\n\r\n'
     ).encode()
-    with connect(ip) as s:
-        s.sendall(head + body)
-        chunks = []
-        while chunk := s.recv(65536):
-            chunks.append(chunk)
-    raw = b"".join(chunks)
+    raw = b""
+    sock = take_spare(ip) if spare else None
+    if sock:
+        try:
+            raw = exchange(sock, head + body)
+        except OSError:
+            pass
+    # An empty answer means the speaker had already dropped the spare unread.
+    if not raw:
+        raw = exchange(connect(ip), head + body)
     header, _, payload = raw.partition(b"\r\n\r\n")
     if b" 200 " not in header.split(b"\r\n", 1)[0]:
         raise RuntimeError(f"{action} failed on {ip}")
@@ -474,7 +518,7 @@ def play_uri(ip, uri, uuid=None):
         f"SA_RINCON{service}_X_#Svc{service}-0-Token</desc></item></DIDL-Lite>"
     )
     uuid = uuid or next(g["uuid"] for g in topology(ip) if g["ip"] == ip)
-    soap(ip, "AVTransport", "RemoveAllTracksFromQueue")
+    soap(ip, "AVTransport", "RemoveAllTracksFromQueue", spare=True)
     soap(ip, "AVTransport", "AddURIToQueue",
          f"<InstanceID>0</InstanceID><EnqueuedURI>{escape(prefix + encoded)}</EnqueuedURI>"
          f"<EnqueuedURIMetaData>{escape(didl)}</EnqueuedURIMetaData>"
@@ -491,23 +535,23 @@ def control(cmd, ip, arg=None):
     if cmd in ("play", "pause", "next", "prev"):
         action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
         extra = "<Speed>1</Speed>" if cmd == "play" else ""
-        soap(ip, "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}")
+        soap(ip, "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}", spare=True)
     elif cmd == "join":
         soap(ip, "AVTransport", "SetAVTransportURI",
-             f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(arg)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+             f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(arg)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>", spare=True)
     elif cmd == "leave" and arg:
         soap(ip, "AVTransport", "DelegateGroupCoordinationTo",
-             f"<InstanceID>0</InstanceID><NewCoordinator>{escape(arg)}</NewCoordinator><RejoinGroup>0</RejoinGroup>")
+             f"<InstanceID>0</InstanceID><NewCoordinator>{escape(arg)}</NewCoordinator><RejoinGroup>0</RejoinGroup>", spare=True)
     elif cmd == "leave":
-        soap(ip, "AVTransport", "BecomeCoordinatorOfStandaloneGroup")
+        soap(ip, "AVTransport", "BecomeCoordinatorOfStandaloneGroup", spare=True)
     elif cmd == "speaker-volume":
         level = max(0, min(100, int(arg)))
         soap(ip, "RenderingControl", "SetVolume",
-             f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>")
+             f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>", spare=True)
     elif cmd == "volume":
         level = max(0, min(100, int(arg)))
         soap(ip, "GroupRenderingControl", "SetGroupVolume",
-             f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>")
+             f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>", spare=True)
 
 
 class Server:
@@ -528,6 +572,7 @@ class Server:
         self.last = ""
         self.preferred = []
         self.uuids = {}          # coordinator ip -> uuid, for play-uri
+        self.hosts = []          # every speaker, for spare connections
         self.volumes = {}        # (cmd, ip) -> newest level not yet sent
         self.query = None
         self.searching = False
@@ -558,6 +603,24 @@ class Server:
             self.gen += 1
             self.inflight -= 1
         self.poke(*confirm)
+        self.keep_spares()
+
+    def keep_spares(self):
+        """Give every speaker a fresh spare connection while the popup is open."""
+        if self.interval > 2:
+            return
+        now = time.monotonic()
+        with spares_lock:
+            stale = [ip for ip in self.hosts if now - spares.get(ip, (None, 0))[1] > SPARE_AGE - 2]
+        for ip in stale:
+            self.pool.submit(add_spare, ip)
+
+    def drop_spares(self):
+        with spares_lock:
+            old = list(spares.values())
+            spares.clear()
+        for sock, _ in old:
+            sock.close()
 
     def run_control(self, cmd, ip, arg, confirm):
         try:
@@ -628,6 +691,10 @@ class Server:
             self.interval = float(msg.get("interval", 10))
             self.force = True
             self.wake.set()
+            if self.interval > 2:
+                self.drop_spares()
+            else:
+                self.keep_spares()
             if msg.get("warm"):
                 self.pool.submit(self.warm_spotify)
         elif cmd == "refresh":
@@ -675,6 +742,8 @@ class Server:
             force, self.force = self.force, False
             for g in data["groups"]:
                 self.uuids[g["ip"]] = g["uuid"]
+            if data["rooms"]:
+                self.hosts = [r["ip"] for r in data["rooms"]]
             if data["groups"]:
                 self.preferred = [data["groups"][0]["ip"]]
             line = json.dumps(data)
@@ -688,6 +757,7 @@ class Server:
             self.wake.wait(self.interval)
             self.wake.clear()
             self.pool.submit(self.poll)
+            self.keep_spares()
 
     def run(self):
         threading.Thread(target=self.poll_loop, daemon=True).start()
