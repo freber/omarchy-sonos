@@ -4,7 +4,16 @@ A fast Sonos bar widget for the Omarchy shell. A speaker icon in the bar opens a
 
 ![The Sonos popup: rooms with playback controls, a grouped room expanded to per-speaker volume and room chips](preview.png)
 
-Official Sonos apps are slow. This one talks straight to the speakers on your network, updates the popup the moment you press something and lets the speakers confirm in the background.
+## Built for speed
+
+The official Sonos apps feel sluggish. This widget is built to be the opposite:
+
+- **Instant feedback:** every press updates the popup immediately and the speakers confirm in the background, typically within 0.3 s.
+- **No cloud:** it talks straight to the speakers on your network, never through Sonos' servers.
+- **Always running:** the helper stays alive next to the shell, so a click never waits for anything to start.
+- **No one-second stalls:** speakers on Wi-Fi sometimes drop the first packet of a connection and TCP waits a full second to retry. The helper races a fresh attempt every 150 ms instead.
+- **Live state:** while the popup is open it reads every speaker once a second, so changes from the Sonos app, other people or the buttons on a speaker show up within a second.
+- **Fast search:** the Spotify connection is opened when the popup opens and reused, so results arrive as you type.
 
 ## Install
 
@@ -50,7 +59,9 @@ US Spotify accounts add `"sonos_service": 3079` to that file.
 
 ## How it works
 
-`sonos` is a small Python helper (standard library only) that speaks UPnP to the speakers. Speaker addresses are cached in `~/.cache/omasonos.json`, so a full status update is one parallel round trip. Volume changes are sent one at a time with the newest value, so dragging a slider never lands out of order.
+`sonos` is a small Python helper (standard library only) that speaks UPnP to the speakers. The widget runs it as `sonos serve`, a long-running process that takes commands and returns status as JSON lines; it exits with the shell. Speaker addresses are cached in `~/.cache/omasonos.json`, so a full status update is one parallel round trip to every speaker. Volume changes go out one at a time per speaker with the newest value, so dragging a slider never lands out of order.
+
+The same helper works from a terminal: `sonos status`, `sonos play <ip>`, `sonos volume <ip> 30` and so on. Run `sonos help` for the full list.
 
 ## License
 

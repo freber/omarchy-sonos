@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tiny Sonos UPnP client for the Sonos bar widget. Standard library only.
 
+  sonos [--hosts ip,ip] serve           long-running mode for the widget: JSON lines in and out
   sonos [--hosts ip,ip] status          JSON for every group
   sonos play|pause|next|prev <ip>       transport control on a group coordinator
   sonos volume <ip> <0-100>             group volume
@@ -18,20 +19,30 @@ Search uses the Spotify Web API with the login saved in ~/.config/omasonos/spoti
 Playback goes through the Spotify account already linked in Sonos.
 
 Speaker IPs are cached so status never waits on discovery once one is known.
+
+Speed is the point. `serve` keeps one process alive so a click never waits for
+Python to start, polls every second while the popup is open, confirms a
+control about 250 ms after it lands and keeps the Spotify connection warm.
+Speakers on Wi-Fi sometimes drop the first packet of a connection and TCP
+waits a full second to retry, so every connection races a fresh attempt
+every 150 ms instead.
 """
 import base64
+import http.client
 import ipaddress
 import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -48,7 +59,35 @@ PATHS = {
     "RenderingControl": "/MediaRenderer/RenderingControl/Control",
     "ZoneGroupTopology": "/ZoneGroupTopology/Control",
 }
-http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+HEDGE = 0.15
+
+
+def connect(ip):
+    """Start a fresh connection attempt every HEDGE seconds until one answers, so a
+    dropped first packet costs 150 ms instead of TCP's one-second retry."""
+    pending = []
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"{ip} did not answer")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setblocking(False)
+            s.connect_ex((ip, PORT))
+            pending.append(s)
+            _, ready, _ = select.select([], pending, [], min(HEDGE, left))
+            for s in ready:
+                err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err:
+                    raise OSError(err, os.strerror(err))
+                pending.remove(s)
+                s.setblocking(True)
+                s.settimeout(TIMEOUT)
+                return s
+    finally:
+        for s in pending:
+            s.close()
 
 
 def soap(ip, service, action, args="<InstanceID>0</InstanceID>"):
@@ -57,13 +96,32 @@ def soap(ip, service, action, args="<InstanceID>0</InstanceID>"):
         's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
         f'<u:{action} xmlns:u="urn:schemas-upnp-org:service:{service}:1">{args}</u:{action}>'
         "</s:Body></s:Envelope>"
-    )
-    req = urllib.request.Request(f"http://{ip}:{PORT}{PATHS[service]}", body.encode(), {
-        "Content-Type": 'text/xml; charset="utf-8"',
-        "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"',
-    })
-    with http.open(req, timeout=TIMEOUT) as r:
-        resp = ET.fromstring(r.read()).find(f".//{{*}}{action}Response")
+    ).encode()
+    head = (
+        f"POST {PATHS[service]} HTTP/1.1\r\nHost: {ip}:{PORT}\r\nConnection: close\r\n"
+        f'Content-Type: text/xml; charset="utf-8"\r\nContent-Length: {len(body)}\r\n'
+        f'SOAPACTION: "urn:schemas-upnp-org:service:{service}:1#{action}"\r\n\r\n'
+    ).encode()
+    with connect(ip) as s:
+        s.sendall(head + body)
+        chunks = []
+        while chunk := s.recv(65536):
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    header, _, payload = raw.partition(b"\r\n\r\n")
+    if b" 200 " not in header.split(b"\r\n", 1)[0]:
+        raise RuntimeError(f"{action} failed on {ip}")
+    if b"chunked" in header.lower():
+        out, rest = [], payload
+        while rest:
+            size, _, rest = rest.partition(b"\r\n")
+            n = int(size.split(b";")[0] or b"0", 16)
+            if n == 0:
+                break
+            out.append(rest[:n])
+            rest = rest[n + 2:]
+        payload = b"".join(out)
+    resp = ET.fromstring(payload).find(f".//{{*}}{action}Response")
     return {c.tag: c.text or "" for c in resp} if resp is not None else {}
 
 
@@ -116,24 +174,48 @@ def discover():
         return [h for h in ex.map(probe, hosts) if h]
 
 
-def load_groups(manual):
+def first_topology(candidates):
+    """Ask the first candidate; if it fails, ask all the others at once."""
+    candidates = list(dict.fromkeys(candidates))
+    if not candidates:
+        return None
+    try:
+        return topology(candidates[0]) or None
+    except Exception:
+        pass
+    rest = candidates[1:]
+    if not rest:
+        return None
+    with ThreadPoolExecutor(len(rest)) as ex:
+        for fut in as_completed([ex.submit(topology, ip) for ip in rest]):
+            try:
+                if groups := fut.result():
+                    return groups
+            except Exception:
+                pass
+    return None
+
+
+def cached_hosts():
     try:
         with open(CACHE) as f:
-            cached = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
-        cached = []
-    for candidates in (manual + cached, None):
-        for ip in candidates if candidates is not None else discover():
-            try:
-                groups = topology(ip)
-            except Exception:
-                continue
-            if groups:
-                os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-                with open(CACHE, "w") as f:
-                    json.dump(sorted({m["ip"] for g in groups for m in g["members"]}), f)
-                return groups
-    return []
+        return []
+
+
+def save_hosts(groups):
+    hosts = sorted({m["ip"] for g in groups for m in g["members"]})
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE, "w") as f:
+        json.dump(hosts, f)
+
+
+def load_groups(manual, preferred=()):
+    groups = first_topology([*preferred, *manual, *cached_hosts()]) or first_topology(discover())
+    if groups:
+        save_hosts(groups)
+    return groups or []
 
 
 def text(node, tag):
@@ -166,22 +248,38 @@ def speaker_volume(ip):
 
 
 def fill(group, pool):
+    """Ask for state, volume and track at once; returns a function that waits for them."""
     ip = group["ip"]
     calls = {
         "state": pool.submit(lambda: soap(ip, "AVTransport", "GetTransportInfo")["CurrentTransportState"]),
         "volume": pool.submit(lambda: int(soap(ip, "GroupRenderingControl", "GetGroupVolume")["CurrentVolume"])),
         "track": pool.submit(now_playing, ip),
     }
-    for key, fut in calls.items():
+
+    def collect():
+        for key, fut in calls.items():
+            try:
+                value = fut.result()
+            except Exception:
+                value = {} if key == "track" else ("" if key == "state" else 0)
+            if key == "track":
+                group.update(value)
+            else:
+                group[key] = value
+        return group
+    return collect
+
+
+def status(groups, pool):
+    rooms = sorted((m for g in groups for m in g.pop("members")), key=lambda m: m["name"].lower())
+    volumes = [(r, pool.submit(speaker_volume, r["ip"])) for r in rooms]
+    groups = [collect() for collect in [fill(g, pool) for g in groups]]
+    for r, fut in volumes:
         try:
-            value = fut.result()
+            r["volume"] = fut.result()
         except Exception:
-            value = {} if key == "track" else ("" if key == "state" else 0)
-        if key == "track":
-            group.update(value)
-        else:
-            group[key] = value
-    return group
+            r["volume"] = 0
+    return {"groups": sorted(groups, key=lambda g: g["name"].lower()), "rooms": rooms}
 
 
 def spotify_conf():
@@ -223,6 +321,8 @@ def spotify_token():
     except (OSError, ValueError, KeyError):
         pass
     conf = spotify_conf()
+    if "refresh_token" not in conf and "client_secret" not in conf:
+        raise RuntimeError("Log in to Spotify first")
     if "refresh_token" not in conf:  # older setup with a client secret
         return token_request({"grant_type": "client_credentials"},
                              f"{conf['client_id']}:{conf['client_secret']}")["access_token"]
@@ -292,12 +392,44 @@ def spotify_login(client_id):
     save_spotify_conf({"client_id": client_id, "refresh_token": data["refresh_token"]})
 
 
-def search(query):
+class SpotifyApi:
+    """One kept-alive HTTPS connection, so a search skips the TCP and TLS handshakes."""
+
+    def __init__(self):
+        self.conn = None
+
+    def warm(self):
+        if self.conn is None:
+            self.conn = http.client.HTTPSConnection("api.spotify.com", timeout=5)
+            self.conn.connect()
+
+    def get(self, path):
+        for attempt in (0, 1):
+            try:
+                self.warm()
+                self.conn.request("GET", path, headers={"Authorization": f"Bearer {spotify_token()}"})
+                r = self.conn.getresponse()
+                data = r.read()
+                if r.status == 401 and attempt == 0 and os.path.exists(TOKEN_CACHE):
+                    os.remove(TOKEN_CACHE)  # token revoked early: fetch a new one and retry
+                    continue
+                if r.status == 401:
+                    raise RuntimeError("Spotify login expired, log in again")
+                if r.status != 200:
+                    raise RuntimeError(f"Spotify error {r.status}")
+                return json.loads(data)
+            except (OSError, http.client.HTTPException):
+                if self.conn:
+                    self.conn.close()
+                self.conn = None
+                if attempt:
+                    raise RuntimeError("Spotify is unreachable")
+        raise RuntimeError("Spotify login expired, log in again")
+
+
+def search(query, api=None):
     params = urllib.parse.urlencode({"q": query, "type": "track,album,playlist", "limit": 5})
-    req = urllib.request.Request(f"https://api.spotify.com/v1/search?{params}",
-                                 headers={"Authorization": f"Bearer {spotify_token()}"})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        data = json.load(r)
+    data = (api or SpotifyApi()).get(f"/v1/search?{params}")
 
     def art(item):
         images = item.get("images") or item.get("album", {}).get("images") or []
@@ -325,7 +457,7 @@ SPOTIFY_ITEMS = {
 }
 
 
-def play_uri(ip, uri):
+def play_uri(ip, uri, uuid=None):
     kind = uri.split(":")[1]
     prefix, key, item_class = SPOTIFY_ITEMS[kind]
     encoded = uri.replace(":", "%3a")
@@ -339,7 +471,7 @@ def play_uri(ip, uri):
         '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">'
         f"SA_RINCON{service}_X_#Svc{service}-0-Token</desc></item></DIDL-Lite>"
     )
-    uuid = next(g["uuid"] for g in topology(ip) if g["ip"] == ip)
+    uuid = uuid or next(g["uuid"] for g in topology(ip) if g["ip"] == ip)
     soap(ip, "AVTransport", "RemoveAllTracksFromQueue")
     soap(ip, "AVTransport", "AddURIToQueue",
          f"<InstanceID>0</InstanceID><EnqueuedURI>{escape(prefix + encoded)}</EnqueuedURI>"
@@ -350,6 +482,221 @@ def play_uri(ip, uri):
     soap(ip, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 
 
+CONTROLS = ("play", "pause", "next", "prev", "join", "leave", "volume", "speaker-volume")
+
+
+def control(cmd, ip, arg=None):
+    if cmd in ("play", "pause", "next", "prev"):
+        action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
+        extra = "<Speed>1</Speed>" if cmd == "play" else ""
+        soap(ip, "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}")
+    elif cmd == "join":
+        soap(ip, "AVTransport", "SetAVTransportURI",
+             f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(arg)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+    elif cmd == "leave" and arg:
+        soap(ip, "AVTransport", "DelegateGroupCoordinationTo",
+             f"<InstanceID>0</InstanceID><NewCoordinator>{escape(arg)}</NewCoordinator><RejoinGroup>0</RejoinGroup>")
+    elif cmd == "leave":
+        soap(ip, "AVTransport", "BecomeCoordinatorOfStandaloneGroup")
+    elif cmd == "speaker-volume":
+        level = max(0, min(100, int(arg)))
+        soap(ip, "RenderingControl", "SetVolume",
+             f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>")
+    elif cmd == "volume":
+        level = max(0, min(100, int(arg)))
+        soap(ip, "GroupRenderingControl", "SetGroupVolume",
+             f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>")
+
+
+class Server:
+    """Widget backend: commands arrive as JSON lines on stdin, status and search
+    results leave as JSON lines on stdout. Exits when the widget closes stdin."""
+
+    def __init__(self, manual):
+        self.manual = manual
+        self.pool = ThreadPoolExecutor(64)
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.interval = 10.0
+        self.gen = 0             # bumps whenever a control starts or finishes
+        self.inflight = 0        # controls sent but not yet answered
+        self.force = True        # send the next status even if nothing changed
+        self.seq = 0             # polls started
+        self.shown = 0           # newest poll whose answer was sent
+        self.last = ""
+        self.preferred = []
+        self.uuids = {}          # coordinator ip -> uuid, for play-uri
+        self.volumes = {}        # (cmd, ip) -> newest level not yet sent
+        self.query = None
+        self.searching = False
+        self.spotify = SpotifyApi()
+
+    def emit(self, obj):
+        line = json.dumps(obj)
+        with self.lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def poke(self, *delays):
+        """Poll right away or after the delays, alongside any poll already running."""
+        for d in delays:
+            if d:
+                threading.Timer(d, self.pool.submit, (self.poll,)).start()
+            else:
+                self.pool.submit(self.poll)
+
+    def begin(self):
+        with self.lock:
+            self.gen += 1
+            self.inflight += 1
+            self.force = True
+
+    def end(self, *confirm):
+        with self.lock:
+            self.gen += 1
+            self.inflight -= 1
+        self.poke(*confirm)
+
+    def run_control(self, cmd, ip, arg, confirm):
+        try:
+            control(cmd, ip, arg)
+        except Exception:
+            pass
+        finally:
+            self.end(*confirm)
+
+    # Volume drags send many levels; each speaker gets one command at a time and
+    # always the newest level, so they can never land out of order.
+    def set_volume(self, cmd, ip, level):
+        key = (cmd, ip)
+        with self.lock:
+            busy = key in self.volumes
+            self.volumes[key] = level
+        if not busy:
+            self.begin()
+            self.pool.submit(self.volume_worker, key)
+
+    def volume_worker(self, key):
+        sent = None
+        while True:
+            with self.lock:
+                level = self.volumes[key]
+                if level == sent:
+                    del self.volumes[key]
+                    break
+            try:
+                control(key[0], key[1], level)
+            except Exception:
+                pass
+            sent = level
+        self.end(0)
+
+    def search(self, query):
+        with self.lock:
+            self.query = query
+            if self.searching:
+                return
+            self.searching = True
+        self.pool.submit(self.search_worker)
+
+    def search_worker(self):
+        while True:
+            query = self.query
+            try:
+                out = {"type": "search", "query": query, "results": search(query, self.spotify)}
+            except Exception as e:
+                out = {"type": "search", "query": query, "error": str(e)}
+            with self.lock:
+                if self.query == query:
+                    self.searching = False
+                    break
+        self.emit(out)
+
+    def warm_spotify(self):
+        try:
+            if os.path.exists(SPOTIFY_CONF):
+                spotify_token()
+                self.spotify.warm()
+        except Exception:
+            pass
+
+    def handle(self, msg):
+        cmd, ip = msg.get("cmd"), msg.get("ip")
+        if cmd == "watch":
+            self.interval = float(msg.get("interval", 10))
+            self.force = True
+            self.wake.set()
+            if msg.get("warm"):
+                self.pool.submit(self.warm_spotify)
+        elif cmd == "refresh":
+            self.force = True
+            self.wake.set()
+        elif cmd in ("volume", "speaker-volume"):
+            self.set_volume(cmd, ip, int(msg["value"]))
+        elif cmd in CONTROLS:
+            self.begin()
+            # Track changes take a moment to show up, so look twice.
+            confirm = (0.25, 1.0) if cmd in ("play", "next", "prev") else (0.25,)
+            self.pool.submit(self.run_control, cmd, ip, msg.get("arg"), confirm)
+        elif cmd == "play-uri":
+            self.begin()
+
+            def go():
+                try:
+                    play_uri(ip, msg["uri"], self.uuids.get(ip))
+                except Exception as e:
+                    self.emit({"type": "error", "error": str(e)})
+                finally:
+                    self.end(0.25, 1.0)
+            self.pool.submit(go)
+        elif cmd == "search":
+            self.search(msg.get("query", ""))
+
+    def poll(self):
+        with self.lock:
+            gen, busy = self.gen, self.inflight
+            self.seq += 1
+            seq = self.seq
+        if busy:
+            return  # the control's answer pokes a fresh poll
+        try:
+            groups = load_groups(self.manual, self.preferred)
+            data = status(groups, self.pool)
+            data["error"] = "" if groups else "No Sonos speakers found"
+        except Exception as e:
+            data = {"groups": [], "rooms": [], "error": str(e)}
+        with self.lock:
+            # A control ran meanwhile, or a newer poll already answered.
+            if gen != self.gen or seq < self.shown:
+                return
+            self.shown = seq
+            force, self.force = self.force, False
+            for g in data["groups"]:
+                self.uuids[g["ip"]] = g["uuid"]
+            if data["groups"]:
+                self.preferred = [data["groups"][0]["ip"]]
+            line = json.dumps(data)
+            if not force and line == self.last:
+                return
+            self.last = line
+        self.emit({"type": "status", **data})
+
+    def poll_loop(self):
+        while True:
+            self.wake.wait(self.interval)
+            self.wake.clear()
+            self.pool.submit(self.poll)
+
+    def run(self):
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+        for line in sys.stdin:
+            try:
+                self.handle(json.loads(line))
+            except Exception as e:
+                self.emit({"type": "error", "error": str(e)})
+        os._exit(0)
+
+
 def main(argv):
     manual = []
     if len(argv) > 1 and argv[0] == "--hosts":
@@ -358,17 +705,10 @@ def main(argv):
     cmd = argv[0] if argv else "status"
 
     if cmd == "status":
-        groups = load_groups(manual)
-        rooms = sorted((m for g in groups for m in g.pop("members")), key=lambda m: m["name"].lower())
         with ThreadPoolExecutor(32) as pool:
-            volumes = [(r, pool.submit(speaker_volume, r["ip"])) for r in rooms]
-            groups = [fill(g, pool) for g in groups]
-            for r, fut in volumes:
-                try:
-                    r["volume"] = fut.result()
-                except Exception:
-                    r["volume"] = 0
-        print(json.dumps({"groups": sorted(groups, key=lambda g: g["name"].lower()), "rooms": rooms}))
+            print(json.dumps(status(load_groups(manual), pool)))
+    elif cmd == "serve":
+        Server(manual).run()
     elif cmd == "search":
         print(json.dumps({"results": search(" ".join(argv[1:]))}))
     elif cmd == "spotify-status":
@@ -392,27 +732,9 @@ def main(argv):
         if os.path.exists(TOKEN_CACHE):
             os.remove(TOKEN_CACHE)
     elif cmd == "play-uri":
-        play_uri(argv[1], argv[2])
-    elif cmd in ("play", "pause", "next", "prev"):
-        action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
-        extra = "<Speed>1</Speed>" if cmd == "play" else ""
-        soap(argv[1], "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}")
-    elif cmd == "join":
-        soap(argv[1], "AVTransport", "SetAVTransportURI",
-             f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(argv[2])}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
-    elif cmd == "leave" and len(argv) > 2:
-        soap(argv[1], "AVTransport", "DelegateGroupCoordinationTo",
-             f"<InstanceID>0</InstanceID><NewCoordinator>{escape(argv[2])}</NewCoordinator><RejoinGroup>0</RejoinGroup>")
-    elif cmd == "leave":
-        soap(argv[1], "AVTransport", "BecomeCoordinatorOfStandaloneGroup")
-    elif cmd == "speaker-volume":
-        level = max(0, min(100, int(argv[2])))
-        soap(argv[1], "RenderingControl", "SetVolume",
-             f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>")
-    elif cmd == "volume":
-        level = max(0, min(100, int(argv[2])))
-        soap(argv[1], "GroupRenderingControl", "SetGroupVolume",
-             f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>")
+        play_uri(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
+    elif cmd in CONTROLS:
+        control(cmd, *argv[1:])
     else:
         sys.exit(__doc__)
 

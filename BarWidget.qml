@@ -7,8 +7,9 @@ import qs.Ui
 
 // Speaker icon in the bar with a popup listing every Sonos group plus Spotify
 // search and grouping. All network work happens in the `sonos` helper next to
-// this file. Controls update the UI immediately and the next status poll
-// confirms what the speakers report.
+// this file, kept running in `serve` mode so a click never waits for it to
+// start. Controls update the UI immediately; the helper confirms what the
+// speakers report a moment later and polls every second while the popup is open.
 Panel {
   id: root
   moduleName: "freber.sonos"
@@ -24,9 +25,7 @@ Panel {
   property var pendingGroups: ({})    // room ip -> { group, until, alone, quiet } for joins/leaves in flight
   property bool loaded: false
   property string error: ""
-  property int actionSerial: 0
   property real wheelAccumulator: 0
-  property var pendingVolumes: ({})   // ip -> { cmd, volume } not yet sent
   property var volumeBaseline: null   // group and speaker volumes when a group drag began
 
   property string query: ""
@@ -60,38 +59,42 @@ Panel {
   readonly property string iconLink: glyph(0xF0337)
   readonly property string iconLogout: glyph(0xF0343)
 
-  function refresh() {
-    // Wait for volume changes to land so a poll never reads the old level.
-    if (statusProc.running || volumeProc.running || Object.keys(pendingVolumes).length > 0) return
-    statusProc.serial = actionSerial
-    statusProc.command = baseCommand.concat(["status"])
-    statusProc.running = true
+  function request(msg) {
+    if (helperProc.running) helperProc.write(JSON.stringify(msg) + "\n")
   }
 
-  function applyStatus(raw) {
-    try {
-      var data = JSON.parse(raw)
-      groups = data.groups || []
-      // Keep showing requested group changes until the speakers report them.
-      var pending = {}
-      var now = Date.now()
-      var fresh = data.rooms || []
-      rooms = fresh.map(function(r) {
-        var p = pendingGroups[r.ip]
-        // A departing coordinator already "groups" itself; it is done once nobody else follows it.
-        var done = p && (p.alone
-          ? fresh.filter(function(m) { return m.group === r.ip }).length === 1
-          : p.group === r.group)
-        if (!p || done || now > p.until) return r
-        pending[r.ip] = p
-        return Object.assign({}, r, { group: p.group })
-      })
-      pendingGroups = pending
-      volumeBaseline = null
-      error = data.error || (groups.length === 0 ? "No Sonos speakers found" : "")
-    } catch (e) {
-      error = "Sonos helper failed"
-    }
+  // Poll every second while the popup is open so changes made elsewhere show
+  // up quickly; the bar icon only needs an occasional look.
+  function watch() {
+    request({ cmd: "watch", interval: opened ? 1 : 10, warm: opened && spotifyReady })
+  }
+
+  function receive(line) {
+    var data
+    try { data = JSON.parse(line) } catch (e) { return }
+    if (data.type === "status") applyStatus(data)
+    else if (data.type === "search") applySearch(data)
+  }
+
+  function applyStatus(data) {
+    groups = data.groups || []
+    // Keep showing requested group changes until the speakers report them.
+    var pending = {}
+    var now = Date.now()
+    var fresh = data.rooms || []
+    rooms = fresh.map(function(r) {
+      var p = pendingGroups[r.ip]
+      // A departing coordinator already "groups" itself; it is done once nobody else follows it.
+      var done = p && (p.alone
+        ? fresh.filter(function(m) { return m.group === r.ip }).length === 1
+        : p.group === r.group)
+      if (!p || done || now > p.until) return r
+      pending[r.ip] = p
+      return Object.assign({}, r, { group: p.group })
+    })
+    pendingGroups = pending
+    volumeBaseline = null
+    error = data.error || (groups.length === 0 ? "No Sonos speakers found" : "")
     loaded = true
     syncModels()
   }
@@ -130,22 +133,16 @@ Panel {
     return n
   }
 
-  function send(args) {
-    actionSerial++
-    Quickshell.execDetached([helper].concat(args))
-    confirmTimer.restart()
-  }
-
   function togglePlay(group) {
     if (!group) return
     var playing = group.state === "PLAYING"
     patch(group.ip, { state: playing ? "PAUSED_PLAYBACK" : "PLAYING" })
-    send([playing ? "pause" : "play", group.ip])
+    request({ cmd: playing ? "pause" : "play", ip: group.ip })
   }
 
   function skip(group, direction) {
     if (!group) return
-    send([direction > 0 ? "next" : "prev", group.ip])
+    request({ cmd: direction > 0 ? "next" : "prev", ip: group.ip })
   }
 
   function toggleMember(room, group) {
@@ -156,7 +153,7 @@ Panel {
     pending[room.ip] = { group: target, until: Date.now() + 10000 }
     pendingGroups = pending
     patchRoom(room.ip, { group: target })
-    send(joining ? ["join", room.ip, group.uuid] : ["leave", room.ip])
+    request(joining ? { cmd: "join", ip: room.ip, arg: group.uuid } : { cmd: "leave", ip: room.ip })
   }
 
   // The coordinator hands the group and its playback to another member, then
@@ -187,16 +184,13 @@ Panel {
     if (targetIp === group.ip) targetIp = heir.ip
     groupEdit = heir.ip
     syncModels()
-    send(["leave", room.ip, heir.uuid])
+    request({ cmd: "leave", ip: room.ip, arg: heir.uuid })
   }
 
-  // One volume command at a time, always with the newest level, so commands
-  // can never land out of order while a slider is dragged.
+  // The helper sends one level at a time per speaker, always the newest, so
+  // levels never land out of order while a slider is dragged.
   function queueVolume(cmd, ip, volume) {
-    var pending = Object.assign({}, pendingVolumes)
-    pending[ip] = { cmd: cmd, volume: volume }
-    pendingVolumes = pending
-    flushVolume()
+    request({ cmd: cmd, ip: ip, value: volume })
   }
 
   function setVolume(group, volume) {
@@ -232,36 +226,16 @@ Panel {
     queueVolume("speaker-volume", room.ip, volume)
   }
 
-  function flushVolume() {
-    var ips = Object.keys(pendingVolumes)
-    if (volumeProc.running || ips.length === 0) return
-    var next = pendingVolumes[ips[0]]
-    var pending = Object.assign({}, pendingVolumes)
-    delete pending[ips[0]]
-    pendingVolumes = pending
-    actionSerial++
-    volumeProc.command = [helper, next.cmd, ips[0], String(next.volume)]
-    volumeProc.running = true
-    confirmTimer.restart()
-  }
-
   function runSearch() {
     if (query.trim() === "") { results = []; searchError = ""; return }
-    if (searchProc.running) return   // onExited picks up the newer query
-    searchProc.query = query
-    searchProc.command = [helper, "search", query]
-    searchProc.running = true
+    request({ cmd: "search", query: query })
   }
 
-  function applySearch(raw) {
-    try {
-      var data = JSON.parse(raw)
-      results = data.results || []
-      searchError = data.error || (results.length === 0 ? "No results" : "")
-      if (data.error && /log in/i.test(data.error)) spotifyReady = false
-    } catch (e) {
-      searchError = "Search failed"
-    }
+  function applySearch(data) {
+    if (data.query !== query) return   // the helper answers the newest query too
+    results = data.results || []
+    searchError = data.error || (results.length === 0 ? "No results" : "")
+    if (data.error && /log in/i.test(data.error)) spotifyReady = false
     selectedResult = 0
   }
 
@@ -269,7 +243,7 @@ Panel {
     var group = targetGroup
     if (!result || !group) return
     patch(group.ip, { state: "PLAYING", title: result.title, artist: result.subtitle })
-    send(["play-uri", group.ip, result.uri])
+    request({ cmd: "play-uri", ip: group.ip, uri: result.uri })
     searchField.text = ""
   }
 
@@ -292,8 +266,9 @@ Panel {
     loginProc.running = true
   }
 
-  onOpenedChanged: if (opened) {
-    refresh()
+  onOpenedChanged: {
+    watch()
+    if (!opened) return
     if (spotifyReady) searchField.selectAll()
     else if (!spotifyStatusProc.running) spotifyStatusProc.running = true
   }
@@ -342,33 +317,18 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // The helper runs as long as the widget and exits when its stdin closes.
   Process {
-    id: statusProc
-    property int serial: 0
-    stdout: StdioCollector {
-      waitForEnd: true
-      // A control sent while this poll was in flight makes its answer stale.
-      onStreamFinished: if (statusProc.serial === root.actionSerial) root.applyStatus(text)
-    }
-  }
-
-  Timer {
-    interval: root.opened ? 2000 : 15000
+    id: helperProc
+    command: root.baseCommand.concat(["serve"])
     running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
+    stdinEnabled: true
+    stdout: SplitParser { onRead: function(line) { root.receive(line) } }
+    onRunningChanged: if (running) root.watch()
+    onExited: restartHelper.start()
   }
 
-  Process {
-    id: searchProc
-    property string query: ""
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: if (searchProc.query === root.query) root.applySearch(text)
-    }
-    onExited: if (searchProc.query !== root.query) root.runSearch()
-  }
+  Timer { id: restartHelper; interval: 1000; onTriggered: helperProc.running = true }
 
   Process {
     id: spotifyStatusProc
@@ -398,6 +358,7 @@ Panel {
           root.spotifyReady = true
           root.spotifyClientId = loginProc.command[2]
           root.searchError = ""
+          root.watch()
           clientIdField.text = ""
           Qt.callLater(function() { searchField.forceActiveFocus() })
         } else {
@@ -407,12 +368,7 @@ Panel {
     }
   }
 
-  Timer { id: searchDebounce; interval: 200; onTriggered: root.runSearch() }
-  Timer { id: confirmTimer; interval: 1200; onTriggered: root.refresh() }
-  Process {
-    id: volumeProc
-    onExited: root.flushVolume()
-  }
+  Timer { id: searchDebounce; interval: 120; onTriggered: root.runSearch() }
 
   BarIconButton {
     id: button
