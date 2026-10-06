@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Tiny Sonos UPnP client for the Sonos bar widget. Standard library only.
+
+  sonos [--hosts ip,ip] status          JSON for every group
+  sonos play|pause|next|prev <ip>       transport control on a group coordinator
+  sonos volume <ip> <0-100>             group volume
+  sonos speaker-volume <ip> <0-100>     volume of one speaker inside a group
+  sonos join <ip> <coordinator-uuid>    add a speaker to a group
+  sonos leave <ip> [heir-uuid]          take a speaker out of its group; a coordinator
+                                        first hands the group (and playback) to the heir
+  sonos search <query>                  Spotify tracks, albums and playlists
+  sonos play-uri <ip> <spotify:uri>     replace the queue with a Spotify item and play it
+  sonos spotify-status                  whether Spotify is logged in
+  sonos spotify-login <client-id>       log in through the browser (OAuth with PKCE)
+  sonos spotify-logout                  forget the login, keep the client ID
+
+Search uses the Spotify Web API with the login saved in ~/.config/omasonos/spotify.json.
+Playback goes through the Spotify account already linked in Sonos.
+
+Speaker IPs are cached so status never waits on discovery once one is known.
+"""
+import base64
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
+
+CACHE_DIR = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+CACHE = os.path.join(CACHE_DIR, "omasonos.json")
+TOKEN_CACHE = os.path.join(CACHE_DIR, "omasonos-spotify-token.json")
+SPOTIFY_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                            "omasonos", "spotify.json")
+PORT = int(os.environ.get("OMASONOS_PORT", "1400"))
+TIMEOUT = 2
+PATHS = {
+    "AVTransport": "/MediaRenderer/AVTransport/Control",
+    "GroupRenderingControl": "/MediaRenderer/GroupRenderingControl/Control",
+    "RenderingControl": "/MediaRenderer/RenderingControl/Control",
+    "ZoneGroupTopology": "/ZoneGroupTopology/Control",
+}
+http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def soap(ip, service, action, args="<InstanceID>0</InstanceID>"):
+    body = (
+        '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+        f'<u:{action} xmlns:u="urn:schemas-upnp-org:service:{service}:1">{args}</u:{action}>'
+        "</s:Body></s:Envelope>"
+    )
+    req = urllib.request.Request(f"http://{ip}:{PORT}{PATHS[service]}", body.encode(), {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"',
+    })
+    with http.open(req, timeout=TIMEOUT) as r:
+        resp = ET.fromstring(r.read()).find(f".//{{*}}{action}Response")
+    return {c.tag: c.text or "" for c in resp} if resp is not None else {}
+
+
+def topology(ip):
+    state = ET.fromstring(soap(ip, "ZoneGroupTopology", "GetZoneGroupState", "")["ZoneGroupState"])
+    groups = []
+    for g in state.iter("ZoneGroup"):
+        members = [m for m in g.findall("ZoneGroupMember")
+                   if m.get("Invisible") != "1" and m.get("IsZoneBridge") != "1"]
+        coord = next((m for m in members if m.get("UUID") == g.get("Coordinator")), None)
+        if coord is None:
+            continue
+        host = lambda m: re.search(r"//([^:/]+)", m.get("Location", "")).group(1)
+        rooms = sorted({m.get("ZoneName", "") for m in members})
+        groups.append({"ip": host(coord), "uuid": coord.get("UUID"), "name": " + ".join(rooms),
+                       "members": [{"name": m.get("ZoneName", ""), "ip": host(m), "uuid": m.get("UUID"),
+                                    "group": host(coord)} for m in members]})
+    return groups
+
+
+def discover():
+    """SSDP first; if multicast is filtered, scan the local /24s for port 1400."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1)
+    msg = (b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\n'
+           b"MX: 1\r\nST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n")
+    try:
+        for _ in range(2):
+            s.sendto(msg, ("239.255.255.250", 1900))
+        return [s.recvfrom(1024)[1][0]]
+    except OSError:
+        pass
+
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                         capture_output=True, text=True).stdout
+    hosts = []
+    for cidr in re.findall(r"inet (\S+)", out):
+        net = ipaddress.ip_interface(cidr).network
+        if net.prefixlen >= 22 and net.is_private and not net.subnet_of(ipaddress.ip_network("172.16.0.0/12")):
+            hosts += [str(h) for h in net.hosts()]
+
+    def probe(h):
+        try:
+            socket.create_connection((h, PORT), 0.4).close()
+            return h
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(128) as ex:
+        return [h for h in ex.map(probe, hosts) if h]
+
+
+def load_groups(manual):
+    try:
+        with open(CACHE) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        cached = []
+    for candidates in (manual + cached, None):
+        for ip in candidates if candidates is not None else discover():
+            try:
+                groups = topology(ip)
+            except Exception:
+                continue
+            if groups:
+                os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+                with open(CACHE, "w") as f:
+                    json.dump(sorted({m["ip"] for g in groups for m in g["members"]}), f)
+                return groups
+    return []
+
+
+def text(node, tag):
+    found = node.find(f".//{{*}}{tag}")
+    return found.text or "" if found is not None else ""
+
+
+def now_playing(ip):
+    pos = soap(ip, "AVTransport", "GetPositionInfo")
+    uri = pos.get("TrackURI", "")
+    if uri.startswith("x-sonos-htastream"):
+        return {"title": "TV", "artist": "", "art": ""}
+    if uri.startswith("x-rincon-stream"):
+        return {"title": "Line-in", "artist": "", "art": ""}
+    try:
+        meta = ET.fromstring(pos.get("TrackMetaData", ""))
+    except ET.ParseError:
+        return {"title": "", "artist": "", "art": ""}
+    art = text(meta, "albumArtURI")
+    return {
+        "title": text(meta, "streamContent") or text(meta, "title"),
+        "artist": text(meta, "creator"),
+        "art": f"http://{ip}:{PORT}{art}" if art.startswith("/") else art,
+    }
+
+
+def speaker_volume(ip):
+    return int(soap(ip, "RenderingControl", "GetVolume",
+                    "<InstanceID>0</InstanceID><Channel>Master</Channel>")["CurrentVolume"])
+
+
+def fill(group, pool):
+    ip = group["ip"]
+    calls = {
+        "state": pool.submit(lambda: soap(ip, "AVTransport", "GetTransportInfo")["CurrentTransportState"]),
+        "volume": pool.submit(lambda: int(soap(ip, "GroupRenderingControl", "GetGroupVolume")["CurrentVolume"])),
+        "track": pool.submit(now_playing, ip),
+    }
+    for key, fut in calls.items():
+        try:
+            value = fut.result()
+        except Exception:
+            value = {} if key == "track" else ("" if key == "state" else 0)
+        if key == "track":
+            group.update(value)
+        else:
+            group[key] = value
+    return group
+
+
+def spotify_conf():
+    try:
+        with open(SPOTIFY_CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        raise RuntimeError("Log in to Spotify first")
+
+
+def save_spotify_conf(conf):
+    os.makedirs(os.path.dirname(SPOTIFY_CONF), exist_ok=True)
+    with open(os.open(SPOTIFY_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(conf, f)
+
+
+def token_request(params, auth=None):
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if auth:
+        headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+    req = urllib.request.Request("https://accounts.spotify.com/api/token",
+                                 urllib.parse.urlencode(params).encode(), headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("Spotify login expired, log in again" if e.code in (400, 401) else f"Spotify error {e.code}")
+    with open(TOKEN_CACHE, "w") as f:
+        json.dump({"token": data["access_token"], "expires": time.time() + data["expires_in"]}, f)
+    return data
+
+
+def spotify_token():
+    try:
+        with open(TOKEN_CACHE) as f:
+            cached = json.load(f)
+        if cached["expires"] > time.time() + 60:
+            return cached["token"]
+    except (OSError, ValueError, KeyError):
+        pass
+    conf = spotify_conf()
+    if "refresh_token" not in conf:  # older setup with a client secret
+        return token_request({"grant_type": "client_credentials"},
+                             f"{conf['client_id']}:{conf['client_secret']}")["access_token"]
+    data = token_request({"grant_type": "refresh_token", "refresh_token": conf["refresh_token"],
+                          "client_id": conf["client_id"]})
+    if data.get("refresh_token", conf["refresh_token"]) != conf["refresh_token"]:
+        save_spotify_conf({**conf, "refresh_token": data["refresh_token"]})
+    return data["access_token"]
+
+
+REDIRECT = "http://127.0.0.1:8888/callback"
+
+
+def spotify_login(client_id):
+    """Authorization code flow with PKCE: no client secret, one approval in the browser."""
+    import hashlib
+    import http.server
+    import secrets
+    import shutil
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    reply = {}
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            url = urllib.parse.urlsplit(self.path)
+            if url.path != "/callback":
+                self.send_error(404)
+                return
+            reply.update(urllib.parse.parse_qsl(url.query))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<body style='font:16px sans-serif;text-align:center;margin-top:20vh'>"
+                             "Spotify is connected. You can close this tab.</body>".encode())
+
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", 8888), Callback)
+    except OSError:
+        raise RuntimeError("Port 8888 is busy; close what uses it and try again")
+    server.timeout = 1
+
+    url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "client_id": client_id, "response_type": "code", "redirect_uri": REDIRECT, "state": state,
+        "code_challenge_method": "S256", "code_challenge": challenge,
+        "scope": "user-library-read playlist-read-private",
+    })
+    browser = shutil.which("omarchy-launch-browser") or "xdg-open"
+    subprocess.Popen([browser, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    deadline = time.time() + 180
+    while not reply and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+
+    if not reply:
+        raise RuntimeError("Login timed out")
+    if reply.get("state") != state or "code" not in reply:
+        raise RuntimeError("Spotify login was cancelled")
+    data = token_request({"grant_type": "authorization_code", "code": reply["code"], "redirect_uri": REDIRECT,
+                          "client_id": client_id, "code_verifier": verifier})
+    save_spotify_conf({"client_id": client_id, "refresh_token": data["refresh_token"]})
+
+
+def search(query):
+    params = urllib.parse.urlencode({"q": query, "type": "track,album,playlist", "limit": 5})
+    req = urllib.request.Request(f"https://api.spotify.com/v1/search?{params}",
+                                 headers={"Authorization": f"Bearer {spotify_token()}"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        data = json.load(r)
+
+    def art(item):
+        images = item.get("images") or item.get("album", {}).get("images") or []
+        return images[-1]["url"] if images else ""
+
+    def artists(item):
+        return ", ".join(a["name"] for a in item.get("artists", []))
+
+    results = []
+    for t in data.get("tracks", {}).get("items", []):
+        results.append({"uri": t["uri"], "title": t["name"], "subtitle": artists(t), "art": art(t)})
+    for a in data.get("albums", {}).get("items", []):
+        results.append({"uri": a["uri"], "title": a["name"], "subtitle": "Album · " + artists(a), "art": art(a)})
+    for p in filter(None, data.get("playlists", {}).get("items", [])):
+        owner = (p.get("owner") or {}).get("display_name") or ""
+        results.append({"uri": p["uri"], "title": p["name"], "subtitle": "Playlist · " + owner, "art": art(p)})
+    return results
+
+
+# Sonos-side identifiers for Spotify items, as the Sonos app builds them.
+SPOTIFY_ITEMS = {
+    "track": ("", "00032020", "object.item.audioItem.musicTrack"),
+    "album": ("x-rincon-cpcontainer:1004206c", "1004206c", "object.container.album.musicAlbum"),
+    "playlist": ("x-rincon-cpcontainer:1006206c", "1006206c", "object.container.playlistContainer"),
+}
+
+
+def play_uri(ip, uri):
+    kind = uri.split(":")[1]
+    prefix, key, item_class = SPOTIFY_ITEMS[kind]
+    encoded = uri.replace(":", "%3a")
+    # 2311 is Spotify in Europe; US accounts use 3079.
+    service = spotify_conf().get("sonos_service", 2311) if os.path.exists(SPOTIFY_CONF) else 2311
+    didl = (
+        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+        f'<item id="{key}{encoded}" parentID="-1" restricted="true"><dc:title></dc:title>'
+        f"<upnp:class>{item_class}</upnp:class>"
+        '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">'
+        f"SA_RINCON{service}_X_#Svc{service}-0-Token</desc></item></DIDL-Lite>"
+    )
+    uuid = next(g["uuid"] for g in topology(ip) if g["ip"] == ip)
+    soap(ip, "AVTransport", "RemoveAllTracksFromQueue")
+    soap(ip, "AVTransport", "AddURIToQueue",
+         f"<InstanceID>0</InstanceID><EnqueuedURI>{escape(prefix + encoded)}</EnqueuedURI>"
+         f"<EnqueuedURIMetaData>{escape(didl)}</EnqueuedURIMetaData>"
+         "<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
+    soap(ip, "AVTransport", "SetAVTransportURI",
+         f"<InstanceID>0</InstanceID><CurrentURI>x-rincon-queue:{uuid}#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+    soap(ip, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+
+
+def main(argv):
+    manual = []
+    if len(argv) > 1 and argv[0] == "--hosts":
+        manual = [h for h in argv[1].split(",") if h.strip()]
+        argv = argv[2:]
+    cmd = argv[0] if argv else "status"
+
+    if cmd == "status":
+        groups = load_groups(manual)
+        rooms = sorted((m for g in groups for m in g.pop("members")), key=lambda m: m["name"].lower())
+        with ThreadPoolExecutor(32) as pool:
+            volumes = [(r, pool.submit(speaker_volume, r["ip"])) for r in rooms]
+            groups = [fill(g, pool) for g in groups]
+            for r, fut in volumes:
+                try:
+                    r["volume"] = fut.result()
+                except Exception:
+                    r["volume"] = 0
+        print(json.dumps({"groups": sorted(groups, key=lambda g: g["name"].lower()), "rooms": rooms}))
+    elif cmd == "search":
+        print(json.dumps({"results": search(" ".join(argv[1:]))}))
+    elif cmd == "spotify-status":
+        try:
+            conf = spotify_conf()
+        except RuntimeError:
+            conf = {}
+        print(json.dumps({"loggedIn": "refresh_token" in conf or "client_secret" in conf,
+                          "clientId": conf.get("client_id", "")}))
+    elif cmd == "spotify-login":
+        client_id = argv[1].strip() if len(argv) > 1 else ""
+        if not client_id:
+            raise RuntimeError("Paste the Client ID first")
+        spotify_login(client_id)
+        print(json.dumps({"ok": True}))
+    elif cmd == "spotify-logout":
+        try:
+            save_spotify_conf({"client_id": spotify_conf()["client_id"]})
+        except (RuntimeError, KeyError):
+            pass
+        if os.path.exists(TOKEN_CACHE):
+            os.remove(TOKEN_CACHE)
+    elif cmd == "play-uri":
+        play_uri(argv[1], argv[2])
+    elif cmd in ("play", "pause", "next", "prev"):
+        action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
+        extra = "<Speed>1</Speed>" if cmd == "play" else ""
+        soap(argv[1], "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}")
+    elif cmd == "join":
+        soap(argv[1], "AVTransport", "SetAVTransportURI",
+             f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(argv[2])}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+    elif cmd == "leave" and len(argv) > 2:
+        soap(argv[1], "AVTransport", "DelegateGroupCoordinationTo",
+             f"<InstanceID>0</InstanceID><NewCoordinator>{escape(argv[2])}</NewCoordinator><RejoinGroup>0</RejoinGroup>")
+    elif cmd == "leave":
+        soap(argv[1], "AVTransport", "BecomeCoordinatorOfStandaloneGroup")
+    elif cmd == "speaker-volume":
+        level = max(0, min(100, int(argv[2])))
+        soap(argv[1], "RenderingControl", "SetVolume",
+             f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>")
+    elif cmd == "volume":
+        level = max(0, min(100, int(argv[2])))
+        soap(argv[1], "GroupRenderingControl", "SetGroupVolume",
+             f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)

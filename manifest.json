@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "freber.sonos",
+  "name": "Sonos",
+  "version": "0.1.0",
+  "author": "Fredrik Silfver",
+  "license": "MIT",
+  "description": "Fast Sonos control from the bar: play, pause, skip, volume per room and speaker, grouping and Spotify search.",
+  "homepage": "https://github.com/freber/omarchy-sonos",
+  "repository": "https://github.com/freber/omarchy-sonos",
+  "keywords": ["sonos", "spotify", "music", "speakers", "media"],
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Sonos",
+    "description": "Control Sonos speakers on the local network",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "hosts": "" },
+    "schema": [
+      { "key": "hosts", "type": "string", "label": "Speaker IPs (comma-separated, optional)" }
+    ]
+  }
+}
