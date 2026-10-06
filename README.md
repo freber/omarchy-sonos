@@ -12,6 +12,15 @@ omarchy plugin add https://github.com/freber/omarchy-sonos.git --enable
 
 Needs `python3` (standard library only). Speakers are found automatically.
 
+## Remove
+
+```sh
+omarchy plugin remove freber.sonos
+rm -rf ~/.config/omasonos ~/.cache/omasonos.json ~/.cache/omasonos-spotify-token.json
+```
+
+The second line removes the Spotify login and the cached speaker addresses. Nothing else on the system is changed.
+
 ## Use
 
 - **Bar icon:** left click opens the popup. Middle click plays/pauses. Scroll changes the volume of the room that's playing.
