@@ -431,10 +431,24 @@ def spotify_conf():
         raise RuntimeError("Log in to Spotify first")
 
 
+def write_private(path, data):
+    """Write JSON readable only by the owner. A fresh file is created owner-only and
+    swapped in, so an older file with looser permissions never keeps them."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with open(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
 def save_spotify_conf(conf):
-    os.makedirs(os.path.dirname(SPOTIFY_CONF), exist_ok=True)
-    with open(os.open(SPOTIFY_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(conf, f)
+    write_private(SPOTIFY_CONF, conf)
 
 
 def token_request(params, auth=None):
@@ -448,13 +462,15 @@ def token_request(params, auth=None):
             data = json.load(r)
     except urllib.error.HTTPError as e:
         raise RuntimeError("Spotify login expired, log in again" if e.code in (400, 401) else f"Spotify error {e.code}")
-    with open(TOKEN_CACHE, "w") as f:
-        json.dump({"token": data["access_token"], "expires": time.time() + data["expires_in"]}, f)
+    write_private(TOKEN_CACHE, {"token": data["access_token"], "expires": time.time() + data["expires_in"]})
     return data
 
 
 def spotify_token():
     try:
+        # Older versions wrote this file world-readable; tighten it if so.
+        if os.stat(TOKEN_CACHE).st_mode & 0o077:
+            os.chmod(TOKEN_CACHE, 0o600)
         with open(TOKEN_CACHE) as f:
             cached = json.load(f)
         if cached["expires"] > time.time() + 60:

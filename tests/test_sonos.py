@@ -168,6 +168,34 @@ class OneShotTest(HelperTest):
         self.assertEqual(kitchen.state, "PLAYING")
 
 
+class SpotifyFilesTest(HelperTest):
+    def test_token_and_login_files_are_owner_only(self):
+        old = os.umask(0o022)
+        try:
+            self.sonos.save_spotify_conf({"client_id": "x", "refresh_token": "secret"})
+            self.sonos.write_private(self.sonos.TOKEN_CACHE, {"token": "t", "expires": time.time() + 3600})
+        finally:
+            os.umask(old)
+        for path in (self.sonos.SPOTIFY_CONF, self.sonos.TOKEN_CACHE):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
+
+    def test_loose_token_file_is_tightened(self):
+        os.makedirs(self.sonos.CACHE_DIR, exist_ok=True)
+        with open(self.sonos.TOKEN_CACHE, "w") as f:
+            json.dump({"token": "t", "expires": time.time() + 3600}, f)
+        os.chmod(self.sonos.TOKEN_CACHE, 0o644)  # as older versions left it
+        self.assertEqual(self.sonos.spotify_token(), "t")
+        self.assertEqual(os.stat(self.sonos.TOKEN_CACHE).st_mode & 0o777, 0o600)
+
+    def test_rewriting_a_loose_file_makes_it_owner_only(self):
+        os.makedirs(self.sonos.CACHE_DIR, exist_ok=True)
+        with open(self.sonos.TOKEN_CACHE, "w") as f:
+            f.write("{}")
+        os.chmod(self.sonos.TOKEN_CACHE, 0o644)
+        self.sonos.write_private(self.sonos.TOKEN_CACHE, {"token": "t", "expires": 0})
+        self.assertEqual(os.stat(self.sonos.TOKEN_CACHE).st_mode & 0o777, 0o600)
+
+
 class ConnectionTest(HelperTest):
     def test_dropped_spare_falls_back_to_new_connection(self):
         self.sonos.add_spare("127.0.0.1")
