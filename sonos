@@ -6,6 +6,10 @@
   sonos play|pause|next|prev <ip>       transport control on a group coordinator
   sonos volume <ip> <0-100>             group volume
   sonos speaker-volume <ip> <0-100>     volume of one speaker inside a group
+  sonos mute <ip> on|off                mute a group
+  sonos play-mode <ip> <mode>           NORMAL, REPEAT_ALL, REPEAT_ONE, SHUFFLE_NOREPEAT,
+                                        SHUFFLE or SHUFFLE_REPEAT_ONE
+  sonos source <ip> tv|line-in <uuid>   play a speaker's TV or line-in input on a group
   sonos join <ip> <coordinator-uuid>    add a speaker to a group
   sonos leave <ip> [heir-uuid]          take a speaker out of its group; a coordinator
                                         first hands the group (and playback) to the heir
@@ -14,6 +18,9 @@
   sonos spotify-status                  whether Spotify is logged in
   sonos spotify-login <client-id>       log in through the browser (OAuth with PKCE)
   sonos spotify-logout                  forget the login, keep the client ID
+
+`serve` also shows the group the widget points at as a media player
+(MPRIS) when python-gobject is installed, so media keys control Sonos.
 
 Search uses the Spotify Web API with the login saved in ~/.config/omasonos/spotify.json.
 Playback goes through the Spotify account already linked in Sonos.
@@ -54,12 +61,15 @@ SPOTIFY_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expandu
                             "omasonos", "spotify.json")
 PORT = int(os.environ.get("OMASONOS_PORT", "1400"))
 TIMEOUT = 2
+MPRIS = os.environ.get("OMASONOS_MPRIS", "1") != "0"
 PATHS = {
     "AVTransport": "/MediaRenderer/AVTransport/Control",
     "GroupRenderingControl": "/MediaRenderer/GroupRenderingControl/Control",
     "RenderingControl": "/MediaRenderer/RenderingControl/Control",
     "ZoneGroupTopology": "/ZoneGroupTopology/Control",
+    "MusicServices": "/MusicServices/Control",
 }
+INPUTS_CACHE = os.path.join(CACHE_DIR, "omasonos-inputs.json")
 HEDGE = 0.15
 
 
@@ -130,6 +140,19 @@ def exchange(sock, request):
     return b"".join(chunks)
 
 
+class SpeakerError(RuntimeError):
+    """A speaker answered but refused the action."""
+
+    # UPnP error codes speakers return, in words people understand.
+    REASONS = {701: "not possible right now", 711: "not supported for this source",
+               712: "not supported for this source", 714: "not supported for this source",
+               800: "the speaker refused", 804: "the speaker refused"}
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(self.REASONS.get(code, f"the speaker refused (error {code})"))
+
+
 def soap(ip, service, action, args="<InstanceID>0</InstanceID>", spare=False):
     body = (
         '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -153,8 +176,7 @@ def soap(ip, service, action, args="<InstanceID>0</InstanceID>", spare=False):
     if not raw:
         raw = exchange(connect(ip), head + body)
     header, _, payload = raw.partition(b"\r\n\r\n")
-    if b" 200 " not in header.split(b"\r\n", 1)[0]:
-        raise RuntimeError(f"{action} failed on {ip}")
+    ok = b" 200 " in header.split(b"\r\n", 1)[0]
     if b"chunked" in header.lower():
         out, rest = [], payload
         while rest:
@@ -165,6 +187,9 @@ def soap(ip, service, action, args="<InstanceID>0</InstanceID>", spare=False):
             out.append(rest[:n])
             rest = rest[n + 2:]
         payload = b"".join(out)
+    if not ok:
+        code = re.search(rb"<errorCode>(\d+)</errorCode>", payload)
+        raise SpeakerError(int(code.group(1)) if code else 0)
     resp = ET.fromstring(payload).find(f".//{{*}}{action}Response")
     return {c.tag: c.text or "" for c in resp} if resp is not None else {}
 
@@ -196,7 +221,8 @@ def local_networks():
 
 def on_networks(ip, nets):
     try:
-        return any(ipaddress.ip_address(ip) in n for n in nets)
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or any(addr in n for n in nets)
     except ValueError:
         return False
 
@@ -289,23 +315,67 @@ def text(node, tag):
     return found.text or "" if found is not None else ""
 
 
+def seconds(clock):
+    try:
+        h, m, s = (int(x) for x in clock.split(":"))
+        return h * 3600 + m * 60 + s
+    except ValueError:
+        return 0
+
+
 def now_playing(ip):
     pos = soap(ip, "AVTransport", "GetPositionInfo")
     uri = pos.get("TrackURI", "")
+    track = {"title": "", "artist": "", "album": "", "art": "", "source": "",
+             "position": seconds(pos.get("RelTime", "")), "duration": seconds(pos.get("TrackDuration", ""))}
     if uri.startswith("x-sonos-htastream"):
-        return {"title": "TV", "artist": "", "art": ""}
+        return {**track, "title": "TV", "source": "tv"}
     if uri.startswith("x-rincon-stream"):
-        return {"title": "Line-in", "artist": "", "art": ""}
+        return {**track, "title": "Line-in", "source": "line-in"}
     try:
         meta = ET.fromstring(pos.get("TrackMetaData", ""))
     except ET.ParseError:
-        return {"title": "", "artist": "", "art": ""}
+        return track
     art = text(meta, "albumArtURI")
     return {
+        **track,
         "title": text(meta, "streamContent") or text(meta, "title"),
         "artist": text(meta, "creator"),
+        "album": text(meta, "album"),
         "art": f"http://{ip}:{PORT}{art}" if art.startswith("/") else art,
     }
+
+
+def speaker_inputs(ip):
+    """TV and line-in inputs a speaker has, from its device description."""
+    with connect(ip) as sock:
+        sock.sendall(f"GET /xml/device_description.xml HTTP/1.1\r\nHost: {ip}:{PORT}\r\nConnection: close\r\n\r\n".encode())
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    desc = b"".join(chunks)
+    return ([] if b"service:HTControl:" not in desc else ["tv"]) + \
+           ([] if b"service:AudioIn:" not in desc else ["line-in"])
+
+
+def inputs_for(rooms, pool):
+    """Inputs per speaker uuid; hardware doesn't change, so answers are cached."""
+    try:
+        with open(INPUTS_CACHE) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+    missing = [(r, pool.submit(speaker_inputs, r["ip"])) for r in rooms if r["uuid"] not in known]
+    for r, fut in missing:
+        try:
+            known[r["uuid"]] = fut.result()
+        except Exception:
+            pass
+    if missing:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(INPUTS_CACHE, "w") as f:
+            json.dump(known, f)
+    return known
 
 
 def speaker_volume(ip):
@@ -320,14 +390,17 @@ def fill(group, pool):
         "state": pool.submit(lambda: soap(ip, "AVTransport", "GetTransportInfo")["CurrentTransportState"]),
         "volume": pool.submit(lambda: int(soap(ip, "GroupRenderingControl", "GetGroupVolume")["CurrentVolume"])),
         "track": pool.submit(now_playing, ip),
+        "muted": pool.submit(lambda: soap(ip, "GroupRenderingControl", "GetGroupMute")["CurrentMute"] == "1"),
+        "playMode": pool.submit(lambda: soap(ip, "AVTransport", "GetTransportSettings")["PlayMode"]),
     }
+    defaults = {"state": "", "volume": 0, "muted": False, "playMode": "NORMAL"}
 
     def collect():
         for key, fut in calls.items():
             try:
                 value = fut.result()
             except Exception:
-                value = {} if key == "track" else ("" if key == "state" else 0)
+                value = {} if key == "track" else defaults[key]
             if key == "track":
                 group.update(value)
             else:
@@ -340,11 +413,13 @@ def status(groups, pool):
     rooms = sorted((m for g in groups for m in g.pop("members")), key=lambda m: m["name"].lower())
     volumes = [(r, pool.submit(speaker_volume, r["ip"])) for r in rooms]
     groups = [collect() for collect in [fill(g, pool) for g in groups]]
+    inputs = inputs_for(rooms, pool)
     for r, fut in volumes:
         try:
             r["volume"] = fut.result()
         except Exception:
             r["volume"] = 0
+        r["inputs"] = inputs.get(r["uuid"], [])
     return {"groups": sorted(groups, key=lambda g: g["name"].lower()), "rooms": rooms}
 
 
@@ -523,12 +598,26 @@ SPOTIFY_ITEMS = {
 }
 
 
-def play_uri(ip, uri, uuid=None):
+def spotify_service(ip):
+    """Sonos' id for the household's Spotify account type: 2311 in Europe, 3079 in the
+    US. A manual "sonos_service" in spotify.json wins; otherwise ask the speaker."""
+    try:
+        if service := spotify_conf().get("sonos_service"):
+            return service
+    except RuntimeError:
+        pass
+    services = soap(ip, "MusicServices", "ListAvailableServices", "").get("AvailableServiceDescriptorList", "")
+    for tag in re.findall(r"<Service [^>]*>", services):
+        if 'Name="Spotify"' in tag and (sid := re.search(r'\bId="(\d+)"', tag)):
+            return int(sid.group(1)) * 256 + 7
+    return 2311
+
+
+def play_uri(ip, uri, uuid=None, service=None):
     kind = uri.split(":")[1]
     prefix, key, item_class = SPOTIFY_ITEMS[kind]
     encoded = uri.replace(":", "%3a")
-    # 2311 is Spotify in Europe; US accounts use 3079.
-    service = spotify_conf().get("sonos_service", 2311) if os.path.exists(SPOTIFY_CONF) else 2311
+    service = service or spotify_service(ip)
     didl = (
         '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
         'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
@@ -548,10 +637,176 @@ def play_uri(ip, uri, uuid=None):
     soap(ip, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 
 
-CONTROLS = ("play", "pause", "next", "prev", "join", "leave", "volume", "speaker-volume")
+CONTROLS = ("play", "pause", "next", "prev", "join", "leave", "volume", "speaker-volume",
+            "mute", "play-mode", "source")
+PLAY_MODES = ("NORMAL", "REPEAT_ALL", "REPEAT_ONE", "SHUFFLE_NOREPEAT", "SHUFFLE", "SHUFFLE_REPEAT_ONE")
+MODE_PARTS = {"NORMAL": (False, ""), "REPEAT_ALL": (False, "all"), "REPEAT_ONE": (False, "one"),
+              "SHUFFLE_NOREPEAT": (True, ""), "SHUFFLE": (True, "all"), "SHUFFLE_REPEAT_ONE": (True, "one")}
 
 
-def control(cmd, ip, arg=None):
+def play_mode(shuffle, repeat):
+    return next(m for m, parts in MODE_PARTS.items() if parts == (bool(shuffle), repeat))
+
+
+def describe(error):
+    """A failure in words for the popup."""
+    if isinstance(error, SpeakerError):
+        return str(error)
+    if isinstance(error, OSError):
+        return "the speaker didn't answer"
+    return str(error) or "something went wrong"
+
+
+MPRIS_XML = """<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/><method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/><method name="Previous"/><method name="Pause"/>
+    <method name="PlayPause"/><method name="Stop"/><method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition"><arg direction="in" name="TrackId" type="o"/><arg direction="in" name="Position" type="x"/></method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="LoopStatus" type="s" access="readwrite"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Shuffle" type="b" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read"/>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>"""
+
+
+class Mpris:
+    """Shows the group the widget points at as a desktop media player, so media
+    keys and the shell's media controls reach Sonos. Needs python-gobject; without
+    it the helper simply runs without this."""
+
+    PATH = "/org/mpris/MediaPlayer2"
+
+    def __init__(self, server, bus_name="org.mpris.MediaPlayer2.sonos"):
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.server = server
+        self.group = None
+        self.at = time.monotonic()
+        self.conn = None
+        self.sent = {}
+        node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+
+        def acquired(conn, name):
+            self.conn = conn
+            register = getattr(conn, "register_object_with_closures2", None) or conn.register_object
+            for iface in node.interfaces:
+                register(self.PATH, iface, self.call, self.get, self.set)
+
+        Gio.bus_own_name(Gio.BusType.SESSION, bus_name, Gio.BusNameOwnerFlags.NONE, acquired, None, None)
+        threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
+
+    # ---- what the desktop sees
+    def props(self):
+        V, g = self.GLib.Variant, self.group or {}
+        shuffle, repeat = MODE_PARTS.get(g.get("playMode", "NORMAL"), (False, ""))
+        state = {"PLAYING": "Playing", "PAUSED_PLAYBACK": "Paused"}.get(g.get("state"), "Stopped")
+        meta = {}
+        if g.get("title"):
+            meta = {"mpris:trackid": V("o", "/org/mpris/MediaPlayer2/sonos/track/%d" % (abs(hash((g["title"], g.get("artist")))) % 10 ** 9)),
+                    "xesam:title": V("s", g["title"]),
+                    "xesam:artist": V("as", [g["artist"]] if g.get("artist") else []),
+                    "xesam:album": V("s", g.get("album", ""))}
+            if g.get("art"):
+                meta["mpris:artUrl"] = V("s", g["art"])
+            if g.get("duration"):
+                meta["mpris:length"] = V("x", g["duration"] * 1_000_000)
+        control = bool(g)
+        return {
+            "org.mpris.MediaPlayer2": {
+                "CanQuit": V("b", False), "CanRaise": V("b", False), "HasTrackList": V("b", False),
+                "Identity": V("s", "Sonos · " + g["name"] if g else "Sonos"),
+                "SupportedUriSchemes": V("as", []), "SupportedMimeTypes": V("as", []),
+            },
+            "org.mpris.MediaPlayer2.Player": {
+                "PlaybackStatus": V("s", state),
+                "LoopStatus": V("s", {"": "None", "all": "Playlist", "one": "Track"}[repeat]),
+                "Shuffle": V("b", shuffle), "Rate": V("d", 1.0),
+                "MinimumRate": V("d", 1.0), "MaximumRate": V("d", 1.0),
+                "Metadata": V("a{sv}", meta), "Volume": V("d", g.get("volume", 0) / 100),
+                "CanGoNext": V("b", control), "CanGoPrevious": V("b", control),
+                "CanPlay": V("b", control), "CanPause": V("b", control),
+                "CanSeek": V("b", False), "CanControl": V("b", control),
+            },
+        }
+
+    def position(self):
+        g = self.group or {}
+        pos = g.get("position", 0) + (time.monotonic() - self.at if g.get("state") == "PLAYING" else 0)
+        return int(min(pos, g.get("duration") or pos) * 1_000_000)
+
+    def update(self, group):
+        """New state from a poll or a control; tells listeners what changed."""
+        self.group, self.at = group, time.monotonic()
+        self.GLib.idle_add(self.announce)
+
+    def announce(self):
+        if self.conn:
+            for iface, values in self.props().items():
+                changed = {k: v for k, v in values.items() if self.sent.get((iface, k)) != v.print_(False)}
+                for k, v in changed.items():
+                    self.sent[(iface, k)] = v.print_(False)
+                if changed:
+                    self.conn.emit_signal(None, self.PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                          self.GLib.Variant("(sa{sv}as)", (iface, changed, [])))
+        return False
+
+    # ---- what the desktop asks
+    def get(self, conn, sender, path, iface, prop):
+        if prop == "Position":
+            return self.GLib.Variant("x", self.position())
+        return self.props()[iface][prop]
+
+    def set(self, conn, sender, path, iface, prop, value):
+        g = self.group
+        if not g:
+            return False
+        shuffle, repeat = MODE_PARTS.get(g.get("playMode", "NORMAL"), (False, ""))
+        if prop == "Volume":
+            self.server.handle({"cmd": "volume", "ip": g["ip"], "value": round(max(0, min(1, value.unpack())) * 100)})
+        elif prop == "Shuffle":
+            self.server.handle({"cmd": "play-mode", "ip": g["ip"], "arg": play_mode(value.unpack(), repeat)})
+        elif prop == "LoopStatus":
+            loop = {"None": "", "Playlist": "all", "Track": "one"}.get(value.unpack(), "")
+            self.server.handle({"cmd": "play-mode", "ip": g["ip"], "arg": play_mode(shuffle, loop)})
+        return True
+
+    def call(self, conn, sender, path, iface, method, params, invocation):
+        g = self.group
+        if g and method in ("Play", "Pause", "PlayPause", "Stop", "Next", "Previous"):
+            playing = g.get("state") == "PLAYING"
+            cmd = {"Play": "play", "Pause": "pause", "Stop": "pause", "Next": "next", "Previous": "prev",
+                   "PlayPause": "pause" if playing else "play"}[method]
+            if cmd in ("play", "pause"):
+                self.update({**g, "state": "PLAYING" if cmd == "play" else "PAUSED_PLAYBACK"})
+            self.server.handle({"cmd": cmd, "ip": g["ip"]})
+        invocation.return_value(None)
+
+
+def control(cmd, ip, arg=None, extra=None):
     if cmd in ("play", "pause", "next", "prev"):
         action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
         extra = "<Speed>1</Speed>" if cmd == "play" else ""
@@ -572,6 +827,21 @@ def control(cmd, ip, arg=None):
         level = max(0, min(100, int(arg)))
         soap(ip, "GroupRenderingControl", "SetGroupVolume",
              f"<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>", spare=True)
+    elif cmd == "mute":
+        on = "1" if str(arg).lower() in ("1", "on", "true") else "0"
+        soap(ip, "GroupRenderingControl", "SetGroupMute",
+             f"<InstanceID>0</InstanceID><DesiredMute>{on}</DesiredMute>", spare=True)
+    elif cmd == "play-mode":
+        if arg not in PLAY_MODES:
+            raise RuntimeError(f"Unknown play mode {arg}")
+        soap(ip, "AVTransport", "SetPlayMode", f"<InstanceID>0</InstanceID><NewPlayMode>{arg}</NewPlayMode>", spare=True)
+    elif cmd == "source":
+        # TV comes from a soundbar's own input; line-in can play on any group.
+        uri = f"x-sonos-htastream:{extra}:spdif" if arg == "tv" else f"x-rincon-stream:{extra}"
+        soap(ip, "AVTransport", "SetAVTransportURI",
+             f"<InstanceID>0</InstanceID><CurrentURI>{escape(uri)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+             spare=True)
+        soap(ip, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 
 
 class Server:
@@ -599,6 +869,24 @@ class Server:
         self.query = None
         self.searching = False
         self.spotify = SpotifyApi()
+        self.service = None      # the household's Spotify id in Sonos, once known
+        self.data = {"groups": [], "rooms": []}
+        self.focus = ""          # group the widget points at; media keys control it
+        self.mpris = None
+        if MPRIS:
+            try:
+                self.mpris = Mpris(self)
+            except Exception:
+                pass
+
+    def failed(self, cmd, ip, error):
+        self.emit({"type": "failed", "cmd": cmd, "ip": ip, "error": describe(error)})
+
+    def focused(self):
+        groups = self.data["groups"]
+        return (next((g for g in groups if g["ip"] == self.focus), None)
+                or next((g for g in groups if g["state"] == "PLAYING"), None)
+                or (groups[0] if groups else None))
 
     def emit(self, obj):
         line = json.dumps(obj)
@@ -644,13 +932,33 @@ class Server:
         for sock, _ in old:
             sock.close()
 
-    def run_control(self, cmd, ip, arg, confirm):
+    def run_control(self, cmd, ip, arg, extra, confirm):
         try:
-            control(cmd, ip, arg)
-        except Exception:
-            pass
+            control(cmd, ip, arg, extra)
+        except Exception as e:
+            self.failed(cmd, ip, e)
         finally:
             self.end(*confirm)
+
+    def regroup(self, cmd, ip):
+        """Join every room into ip's group, or split every group into single rooms."""
+        rooms = self.data["rooms"]
+        if cmd == "group-all":
+            uuid = self.uuids.get(ip)
+            moves = [("join", r["ip"], uuid) for r in rooms if r["group"] != ip]
+        else:
+            moves = [("leave", r["ip"], None) for r in rooms if r["group"] != r["ip"]]
+        self.begin()
+
+        def go():
+            futures = [(m, self.pool.submit(control, *m)) for m in moves]
+            for (c, room, _), fut in futures:
+                try:
+                    fut.result()
+                except Exception as e:
+                    self.failed(c, room, e)
+            self.end(0.25, 1.0)
+        self.pool.submit(go)
 
     # Volume drags send many levels; each speaker gets one command at a time and
     # always the newest level, so they can never land out of order.
@@ -673,8 +981,8 @@ class Server:
                     break
             try:
                 control(key[0], key[1], level)
-            except Exception:
-                pass
+            except Exception as e:
+                self.failed(key[0], key[1], e)
             sent = level
         self.end(0)
 
@@ -727,16 +1035,23 @@ class Server:
         elif cmd in CONTROLS:
             self.begin()
             # Track changes take a moment to show up, so look twice.
-            confirm = (0.25, 1.0) if cmd in ("play", "next", "prev") else (0.25,)
-            self.pool.submit(self.run_control, cmd, ip, msg.get("arg"), confirm)
+            confirm = (0.25, 1.0) if cmd in ("play", "next", "prev", "source") else (0.25,)
+            self.pool.submit(self.run_control, cmd, ip, msg.get("arg"), msg.get("extra"), confirm)
+        elif cmd in ("group-all", "ungroup-all"):
+            self.regroup(cmd, ip)
+        elif cmd == "focus":
+            self.focus = ip or ""
+            if self.mpris:
+                self.mpris.update(self.focused())
         elif cmd == "play-uri":
             self.begin()
 
             def go():
                 try:
-                    play_uri(ip, msg["uri"], self.uuids.get(ip))
+                    self.service = self.service or spotify_service(ip)
+                    play_uri(ip, msg["uri"], self.uuids.get(ip), self.service)
                 except Exception as e:
-                    self.emit({"type": "error", "error": str(e)})
+                    self.failed(cmd, ip, e)
                 finally:
                     self.end(0.25, 1.0)
             self.pool.submit(go)
@@ -766,14 +1081,19 @@ class Server:
                 self.uuids[g["ip"]] = g["uuid"]
             self.hosts = [r["ip"] for r in data["rooms"]]
             self.preferred = [data["groups"][0]["ip"]] if data["groups"] else []
-            line = json.dumps(data)
-            if not force and line == self.last:
-                return
+            self.data = data
+            # Position changes every second; only the media player needs it.
+            shown = {**data, "groups": [{k: v for k, v in g.items() if k != "position"} for g in data["groups"]]}
+            line = json.dumps(shown)
+            changed = force or line != self.last
             self.last = line
-        self.emit({"type": "status", **data})
+        if self.mpris:
+            self.mpris.update(self.focused())
+        if changed:
+            self.emit({"type": "status", **shown})
 
     def find_groups(self):
-        """Never wait on speakers from another network, and search for speakers
+        """Never wait on speakers from another network; search for speakers
         only after joining a network or once a minute while the popup is open,
         so a network without speakers is never scanned over and over."""
         nets = local_networks()
@@ -842,7 +1162,7 @@ def main(argv):
     elif cmd == "play-uri":
         play_uri(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
     elif cmd in CONTROLS:
-        control(cmd, *argv[1:])
+        control(cmd, *argv[1:4])
     else:
         sys.exit(__doc__)
 

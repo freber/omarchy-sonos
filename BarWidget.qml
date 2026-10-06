@@ -25,6 +25,7 @@ Panel {
   property var pendingGroups: ({})    // room ip -> { group, until, alone, quiet } for joins/leaves in flight
   property bool loaded: false
   property string error: ""
+  property var failures: ({})         // group ip -> { text, until } for commands the speakers refused
   property real wheelAccumulator: 0
   property var volumeBaseline: null   // group and speaker volumes when a group drag began
 
@@ -48,6 +49,9 @@ Panel {
       if (groups[i].ip === targetIp) return groups[i]
     return activeGroup
   }
+  // Media keys control the group the popup points at.
+  readonly property string focusIp: targetGroup ? targetGroup.ip : ""
+  onFocusIpChanged: request({ cmd: "focus", ip: focusIp })
   readonly property color dim: Qt.darker(bar ? bar.foreground : Color.foreground, 1.4)
 
   function glyph(code) { return String.fromCodePoint(code) }
@@ -58,6 +62,19 @@ Panel {
   readonly property string iconPrev: glyph(0xF04AE)
   readonly property string iconLink: glyph(0xF0337)
   readonly property string iconLogout: glyph(0xF0343)
+  readonly property string iconMuted: glyph(0xF075F)
+  readonly property string iconShuffle: glyph(0xF049D)
+  readonly property string iconRepeat: glyph(0xF0456)
+  readonly property string iconRepeatOne: glyph(0xF0458)
+  readonly property string iconTv: glyph(0xF0502)
+  readonly property string iconLineIn: glyph(0xF06A5)
+  readonly property string iconMore: glyph(0xF01D8)
+
+  // Sonos play modes as shuffle on/off plus repeat "", "all" or "one".
+  readonly property var playModes: ({
+    NORMAL: [false, ""], REPEAT_ALL: [false, "all"], REPEAT_ONE: [false, "one"],
+    SHUFFLE_NOREPEAT: [true, ""], SHUFFLE: [true, "all"], SHUFFLE_REPEAT_ONE: [true, "one"]
+  })
 
   function request(msg) {
     if (helperProc.running) helperProc.write(JSON.stringify(msg) + "\n")
@@ -67,6 +84,7 @@ Panel {
   // up quickly; the bar icon only needs an occasional look.
   function watch() {
     request({ cmd: "watch", interval: opened ? 1 : 10, warm: opened && spotifyReady })
+    request({ cmd: "focus", ip: focusIp })
   }
 
   function receive(line) {
@@ -74,6 +92,29 @@ Panel {
     try { data = JSON.parse(line) } catch (e) { return }
     if (data.type === "status") applyStatus(data)
     else if (data.type === "search") applySearch(data)
+    else if (data.type === "failed") showFailure(data)
+  }
+
+  // A refused command shows on its room for a few seconds; the next status
+  // puts the room back to what the speakers really report.
+  function showFailure(data) {
+    var verbs = { play: "play", pause: "pause", next: "skip", prev: "go back", volume: "change volume",
+      "speaker-volume": "change volume", join: "group", leave: "ungroup", mute: "mute",
+      "play-mode": "change shuffle or repeat", source: "switch input", "play-uri": "play that" }
+    var ip = data.ip
+    for (var i = 0; i < rooms.length; i++) if (rooms[i].ip === ip) ip = rooms[i].group
+    var next = Object.assign({}, failures)
+    next[ip] = { text: "Couldn't " + (verbs[data.cmd] || "do that") + ": " + data.error, until: Date.now() + 4000 }
+    failures = next
+    failureTimer.restart()
+    request({ cmd: "refresh" })
+  }
+
+  function clearFailures() {
+    var now = Date.now(), next = {}, left = false
+    for (var ip in failures) if (failures[ip].until > now) { next[ip] = failures[ip]; left = true }
+    failures = next
+    if (left) failureTimer.restart()
   }
 
   function applyStatus(data) {
@@ -113,8 +154,12 @@ Panel {
   }
 
   function syncModels() {
-    syncList(groupModel, groups, { uuid: "", title: "", artist: "", state: "", volume: 0 })
-    syncList(roomModel, rooms, { volume: 0 })
+    syncList(groupModel, groups, { uuid: "", title: "", artist: "", state: "", volume: 0,
+                                   muted: false, playMode: "NORMAL", source: "" })
+    // ListModel turns arrays into nested models, so inputs travel as "tv,line-in".
+    syncList(roomModel, rooms.map(function(r) {
+      return Object.assign({}, r, { inputs: (r.inputs || []).join(",") })
+    }), { volume: 0, inputs: "" })
   }
 
   function patch(ip, fields) {
@@ -185,6 +230,54 @@ Panel {
     groupEdit = heir.ip
     syncModels()
     request({ cmd: "leave", ip: room.ip, arg: heir.uuid })
+  }
+
+  function toggleMute(group) {
+    patch(group.ip, { muted: !group.muted })
+    request({ cmd: "mute", ip: group.ip, arg: group.muted ? "off" : "on" })
+  }
+
+  function setPlayMode(group, shuffle, repeat) {
+    for (var mode in playModes) {
+      if (playModes[mode][0] !== shuffle || playModes[mode][1] !== repeat) continue
+      patch(group.ip, { playMode: mode })
+      request({ cmd: "play-mode", ip: group.ip, arg: mode })
+    }
+  }
+
+  function playInput(group, room, kind) {
+    patch(group.ip, { source: kind, state: "PLAYING", title: kind === "tv" ? "TV" : "Line-in", artist: "" })
+    request({ cmd: "source", ip: group.ip, arg: kind, extra: room.uuid })
+  }
+
+  // TV plays from a soundbar leading its group; line-in from any speaker in it.
+  function inputsFor(group) {
+    var out = []
+    for (var i = 0; i < rooms.length; i++) {
+      var r = rooms[i]
+      if (r.group !== group.ip) continue
+      var kinds = r.inputs || []
+      if (kinds.indexOf("tv") >= 0 && r.ip === group.ip) out.push({ kind: "tv", room: r })
+      if (kinds.indexOf("line-in") >= 0) out.push({ kind: "line-in", room: r })
+    }
+    return out
+  }
+
+  // Everything joins the group the popup points at, or every group splits up.
+  function regroupAll(join) {
+    var target = targetGroup
+    if (join && !target) return
+    var pending = Object.assign({}, pendingGroups)
+    var until = Date.now() + 10000
+    rooms = rooms.map(function(r) {
+      var group = join ? target.ip : r.ip
+      if (r.group === group) return r
+      pending[r.ip] = { group: group, until: until }
+      return Object.assign({}, r, { group: group })
+    })
+    pendingGroups = pending
+    syncModels()
+    request(join ? { cmd: "group-all", ip: target.ip } : { cmd: "ungroup-all" })
   }
 
   // The helper sends one level at a time per speaker, always the newest, so
@@ -330,6 +423,42 @@ Panel {
     }
   }
 
+  // A rounded toggle used for rooms, play modes and inputs.
+  component Chip: Rectangle {
+    id: chip
+    property string label: ""
+    property bool selected: false
+    property bool pending: false
+    signal tapped()
+    width: chipLabel.implicitWidth + Style.space(16)
+    height: chipLabel.implicitHeight + Style.space(6)
+    radius: height / 2
+    color: selected ? Color.accent : "transparent"
+    border.width: 1
+    border.color: selected ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+
+    Text {
+      id: chipLabel
+      anchors.centerIn: parent
+      text: chip.label
+      textFormat: Text.PlainText
+      color: chip.selected ? root.bar.background : root.bar.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    // Pulses until the speakers confirm the change.
+    SequentialAnimation on opacity {
+      running: chip.pending
+      loops: Animation.Infinite
+      onRunningChanged: if (!running) chip.opacity = 1
+      NumberAnimation { to: 0.35; duration: 450; easing.type: Easing.InOutSine }
+      NumberAnimation { to: 1; duration: 450; easing.type: Easing.InOutSine }
+    }
+
+    TapHandler { onTapped: chip.tapped() }
+  }
+
   component Caption: Text {
     textFormat: Text.PlainText
     elide: Text.ElideRight
@@ -396,6 +525,7 @@ Panel {
   }
 
   Timer { id: searchDebounce; interval: 120; onTriggered: root.runSearch() }
+  Timer { id: failureTimer; interval: 4000; onTriggered: root.clearFailures() }
 
   BarIconButton {
     id: button
@@ -738,8 +868,8 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
 
                   PanelActionButton {
-                    iconText: root.iconLink
-                    tooltipText: "Speakers and grouping"
+                    iconText: root.iconMore
+                    tooltipText: "Speakers, grouping, shuffle and inputs"
                     foreground: row.expanded ? Color.accent : root.bar.foreground
                     fontFamily: root.bar.fontFamily
                     onClicked: root.groupEdit = row.expanded ? "" : row.model.ip
@@ -772,11 +902,13 @@ Panel {
 
                 Marquee {
                   id: track
+                  readonly property var failure: root.failures[row.model.ip]
                   anchors.left: parent.left
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width * 0.5
-                  text: [row.model.title, row.model.artist].filter(Boolean).join(" — ") || "Nothing playing"
-                  color: root.dim
+                  text: failure ? failure.text
+                    : [row.model.title, row.model.artist].filter(Boolean).join(" — ") || "Nothing playing"
+                  color: failure ? Color.urgent : root.dim
                   font.family: root.bar.fontFamily
                   font.pixelSize: Style.font.caption
                 }
@@ -793,21 +925,67 @@ Panel {
                   step: 1
                   integer: true
                   value: row.model.volume || 0
+                  opacity: row.model.muted ? 0.4 : 1
                   onMoved: function(v) { root.setVolume(row.model, v) }
                   onReleased: function(v) { root.setVolume(row.model, v) }
                 }
 
+                // The number doubles as the mute button.
                 Caption {
                   id: percent
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   width: Style.space(24)
                   horizontalAlignment: Text.AlignRight
-                  text: Math.round(slider.dragging ? slider.liveValue : (row.model.volume || 0))
+                  text: row.model.muted ? root.iconMuted
+                    : Math.round(slider.dragging ? slider.liveValue : (row.model.volume || 0))
+                  color: row.model.muted ? Color.accent : root.dim
+
+                  HoverHandler { cursorShape: Qt.PointingHandCursor }
+                  TapHandler { onTapped: root.toggleMute(row.model) }
                 }
               }
 
-              // ---------- Expanded: speaker volumes, then grouping chips ----------
+              // ---------- Expanded: play modes and inputs, speaker volumes, grouping chips ----------
+              Flow {
+                id: modes
+                readonly property bool fromInput: row.model.source === "tv" || row.model.source === "line-in"
+                readonly property bool shuffle: (root.playModes[row.model.playMode] || [false, ""])[0]
+                readonly property string repeat: (root.playModes[row.model.playMode] || [false, ""])[1]
+                visible: row.expanded
+                width: parent.width
+                spacing: Style.space(6)
+                topPadding: Style.space(4)
+
+                // TV and line-in have no queue, so shuffle and repeat only show for music.
+                Chip {
+                  visible: !modes.fromInput
+                  label: root.iconShuffle + " Shuffle"
+                  selected: modes.shuffle
+                  onTapped: root.setPlayMode(row.model, !modes.shuffle, modes.repeat)
+                }
+                Chip {
+                  visible: !modes.fromInput
+                  label: (modes.repeat === "one" ? root.iconRepeatOne : root.iconRepeat)
+                    + (modes.repeat === "one" ? " Repeat one" : " Repeat")
+                  selected: modes.repeat !== ""
+                  onTapped: root.setPlayMode(row.model, modes.shuffle,
+                    modes.repeat === "" ? "all" : modes.repeat === "all" ? "one" : "")
+                }
+
+                Repeater {
+                  model: row.expanded ? root.inputsFor(row.model) : []
+
+                  Chip {
+                    required property var modelData
+                    label: modelData.kind === "tv" ? root.iconTv + " TV"
+                      : root.iconLineIn + " Line-in" + (row.members > 1 ? " · " + modelData.room.name : "")
+                    selected: row.model.source === modelData.kind
+                    onTapped: root.playInput(row.model, modelData.room, modelData.kind)
+                  }
+                }
+              }
+
               Repeater {
                 model: row.expanded && row.members > 1 ? roomModel : 0
 
@@ -863,42 +1041,33 @@ Panel {
                 Repeater {
                   model: row.expanded ? roomModel : 0
 
-                  Rectangle {
+                  Chip {
                     id: chip
                     required property var model
-                    readonly property bool member: model.group === row.model.ip
-                    readonly property bool pending: chip.model.ip in root.pendingGroups
-                      && !root.pendingGroups[chip.model.ip].quiet
-                    width: chipLabel.implicitWidth + Style.space(16)
-                    height: chipLabel.implicitHeight + Style.space(6)
-                    radius: height / 2
-                    color: member ? Color.accent : "transparent"
-                    border.width: 1
-                    border.color: member ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-
-                    Text {
-                      id: chipLabel
-                      anchors.centerIn: parent
-                      text: chip.model.name
-                      textFormat: Text.PlainText
-                      color: chip.member ? root.bar.background : root.bar.foreground
-                      font.family: root.bar.fontFamily
-                      font.pixelSize: Style.font.caption
-                    }
-
-                    // Pulses until the speakers confirm the join or leave.
-                    SequentialAnimation on opacity {
-                      running: chip.pending
-                      loops: Animation.Infinite
-                      onRunningChanged: if (!running) chip.opacity = 1
-                      NumberAnimation { to: 0.35; duration: 450; easing.type: Easing.InOutSine }
-                      NumberAnimation { to: 1; duration: 450; easing.type: Easing.InOutSine }
-                    }
-
-                    TapHandler { onTapped: root.toggleMember(chip.model, row.model) }
+                    label: model.name
+                    selected: model.group === row.model.ip
+                    pending: model.ip in root.pendingGroups && !root.pendingGroups[model.ip].quiet
+                    onTapped: root.toggleMember(chip.model, row.model)
                   }
                 }
               }
+            }
+          }
+
+          Row {
+            visible: root.query === "" && root.rooms.length > 1
+            spacing: Style.space(6)
+
+            Chip {
+              visible: root.groups.length > 1
+              label: root.iconLink + " Group all"
+              onTapped: root.regroupAll(true)
+            }
+
+            Chip {
+              visible: root.groups.length < root.rooms.length
+              label: "Ungroup all"
+              onTapped: root.regroupAll(false)
             }
           }
         }
