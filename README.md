@@ -2,6 +2,8 @@
 
 A fast Sonos bar widget for the Omarchy shell. A speaker icon in the bar opens a compact popup with every room or group: what's playing, play/pause/skip, volume per group and per speaker, room grouping and Spotify search.
 
+![The Sonos popup: rooms with playback controls, a grouped room expanded to per-speaker volume and room chips](preview.png)
+
 Official Sonos apps are slow. This one talks straight to the speakers on your network, updates the popup the moment you press something and lets the speakers confirm in the background.
 
 ## Install
