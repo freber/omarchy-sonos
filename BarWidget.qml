@@ -867,7 +867,9 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
 
+                  // Grouped rooms open this view from their 🔗 badge instead.
                   PanelActionButton {
+                    visible: !badge.visible
                     iconText: root.iconMore
                     tooltipText: "Speakers, grouping, shuffle and inputs"
                     foreground: row.expanded ? Color.accent : root.bar.foreground
