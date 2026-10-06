@@ -186,7 +186,22 @@ def topology(ip):
     return groups
 
 
-def discover():
+def local_networks():
+    """The private IPv4 networks this machine is on; empty when offline."""
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                         capture_output=True, text=True).stdout
+    return tuple(sorted({ipaddress.ip_interface(c).network for c in re.findall(r"inet (\S+)", out)
+                         if ipaddress.ip_interface(c).network.is_private}, key=str))
+
+
+def on_networks(ip, nets):
+    try:
+        return any(ipaddress.ip_address(ip) in n for n in nets)
+    except ValueError:
+        return False
+
+
+def discover(nets):
     """SSDP first; if multicast is filtered, scan the local /24s for port 1400."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(1)
@@ -199,12 +214,9 @@ def discover():
     except OSError:
         pass
 
-    out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
-                         capture_output=True, text=True).stdout
     hosts = []
-    for cidr in re.findall(r"inet (\S+)", out):
-        net = ipaddress.ip_interface(cidr).network
-        if net.prefixlen >= 22 and net.is_private and not net.subnet_of(ipaddress.ip_network("172.16.0.0/12")):
+    for net in nets:
+        if net.prefixlen >= 22 and not net.subnet_of(ipaddress.ip_network("172.16.0.0/12")):
             hosts += [str(h) for h in net.hosts()]
 
     def probe(h):
@@ -257,8 +269,16 @@ def save_hosts(groups):
         json.dump(hosts, f)
 
 
+def known_hosts(manual, preferred, nets):
+    """Manual hosts, then remembered speakers on the networks we're on now."""
+    return [*manual, *(ip for ip in [*preferred, *cached_hosts()] if on_networks(ip, nets))]
+
+
 def load_groups(manual, preferred=()):
-    groups = first_topology([*preferred, *manual, *cached_hosts()]) or first_topology(discover())
+    nets = local_networks()
+    if not nets and not manual:
+        raise RuntimeError("No network")
+    groups = first_topology(known_hosts(manual, preferred, nets)) or first_topology(discover(nets))
     if groups:
         save_hosts(groups)
     return groups or []
@@ -573,6 +593,8 @@ class Server:
         self.preferred = []
         self.uuids = {}          # coordinator ip -> uuid, for play-uri
         self.hosts = []          # every speaker, for spare connections
+        self.searched_on = None  # networks the last speaker search ran on
+        self.searched_at = 0.0
         self.volumes = {}        # (cmd, ip) -> newest level not yet sent
         self.query = None
         self.searching = False
@@ -729,7 +751,7 @@ class Server:
         if busy:
             return  # the control's answer pokes a fresh poll
         try:
-            groups = load_groups(self.manual, self.preferred)
+            groups = self.find_groups()
             data = status(groups, self.pool)
             data["error"] = "" if groups else "No Sonos speakers found"
         except Exception as e:
@@ -742,15 +764,29 @@ class Server:
             force, self.force = self.force, False
             for g in data["groups"]:
                 self.uuids[g["ip"]] = g["uuid"]
-            if data["rooms"]:
-                self.hosts = [r["ip"] for r in data["rooms"]]
-            if data["groups"]:
-                self.preferred = [data["groups"][0]["ip"]]
+            self.hosts = [r["ip"] for r in data["rooms"]]
+            self.preferred = [data["groups"][0]["ip"]] if data["groups"] else []
             line = json.dumps(data)
             if not force and line == self.last:
                 return
             self.last = line
         self.emit({"type": "status", **data})
+
+    def find_groups(self):
+        """Never wait on speakers from another network, and search for speakers
+        only after joining a network or once a minute while the popup is open,
+        so a network without speakers is never scanned over and over."""
+        nets = local_networks()
+        if not nets and not self.manual:
+            raise RuntimeError("No network")
+        groups = first_topology(known_hosts(self.manual, self.preferred, nets))
+        now = time.monotonic()
+        if not groups and (nets != self.searched_on or (self.interval <= 2 and now - self.searched_at > 60)):
+            self.searched_on, self.searched_at = nets, now
+            groups = first_topology(discover(nets))
+        if groups:
+            save_hosts(groups)
+        return groups or []
 
     def poll_loop(self):
         while True:
