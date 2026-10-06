@@ -206,6 +206,8 @@ def cached_hosts():
 
 def save_hosts(groups):
     hosts = sorted({m["ip"] for g in groups for m in g["members"]})
+    if hosts == cached_hosts():
+        return
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
     with open(CACHE, "w") as f:
         json.dump(hosts, f)

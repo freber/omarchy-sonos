@@ -35,7 +35,7 @@ The second line removes the Spotify login and the cached speaker addresses. Noth
 ## Use
 
 - **Bar icon:** left click opens the popup. Middle click plays/pauses. Scroll changes the volume of the room that's playing.
-- **Rooms:** each group shows an animated spectrum while playing. Long names scroll.
+- **Rooms:** each group shows an animated spectrum while playing. Long room names and song titles roll so they can be read in full.
 - **Grouping:** the link button (or the 🔗 badge on a group) expands it to one volume slider per speaker plus chips for every room. Tap a chip to add or remove that room; it pulses until Sonos confirms.
 - **Search:** type in the search field, pick where it plays with the "Play in" chips, then `enter` or click a result. `esc` clears, then closes.
 

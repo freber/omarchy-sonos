@@ -303,6 +303,33 @@ Panel {
     }
   }
 
+  // Text that rolls back and forth while the popup is open when it doesn't fit.
+  component Marquee: Item {
+    id: marquee
+    property alias text: label.text
+    property alias color: label.color
+    property alias font: label.font
+    readonly property real textWidth: label.implicitWidth
+    readonly property real overflow: Math.max(0, label.implicitWidth - width)
+    implicitHeight: label.implicitHeight
+    clip: overflow > 0
+
+    Text {
+      id: label
+      textFormat: Text.PlainText
+
+      SequentialAnimation on x {
+        running: root.opened && marquee.overflow > 0
+        loops: Animation.Infinite
+        onRunningChanged: if (!running) label.x = 0
+        PauseAnimation { duration: 1500 }
+        NumberAnimation { to: -marquee.overflow; duration: marquee.overflow * 30; easing.type: Easing.InOutSine }
+        PauseAnimation { duration: 1200 }
+        NumberAnimation { to: 0; duration: marquee.overflow * 30; easing.type: Easing.InOutSine }
+      }
+    }
+  }
+
   component Caption: Text {
     textFormat: Text.PlainText
     elide: Text.ElideRight
@@ -665,36 +692,17 @@ Panel {
                     color: Color.accent
                   }
 
-                  // Names that don't fit roll back and forth instead of eliding.
-                  Item {
+                  Marquee {
                     id: nameText
-                    readonly property real overflow: Math.max(0, nameLabel.implicitWidth - width)
-                    width: Math.min(nameLabel.implicitWidth, header.width
+                    width: Math.min(textWidth, header.width
                       - (rowEq.visible ? rowEq.width + header.spacing : 0)
                       - (badge.visible ? badge.width + header.spacing : 0))
-                    height: nameLabel.implicitHeight
-                    clip: overflow > 0
-
-                    Text {
-                      id: nameLabel
-                      text: row.model.name
-                      textFormat: Text.PlainText
-                      color: root.groups.length > 1 && root.targetGroup && root.targetGroup.ip === row.model.ip
-                        ? Color.accent : root.bar.foreground
-                      font.family: root.bar.fontFamily
-                      font.pixelSize: Style.font.body
-                      font.bold: true
-
-                      SequentialAnimation on x {
-                        running: root.opened && nameText.overflow > 0
-                        loops: Animation.Infinite
-                        onRunningChanged: if (!running) nameLabel.x = 0
-                        PauseAnimation { duration: 1500 }
-                        NumberAnimation { to: -nameText.overflow; duration: nameText.overflow * 30; easing.type: Easing.InOutSine }
-                        PauseAnimation { duration: 1200 }
-                        NumberAnimation { to: 0; duration: nameText.overflow * 30; easing.type: Easing.InOutSine }
-                      }
-                    }
+                    text: row.model.name
+                    color: root.groups.length > 1 && root.targetGroup && root.targetGroup.ip === row.model.ip
+                      ? Color.accent : root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
 
                     // Clicking a room makes it the one search results play in.
                     TapHandler { onTapped: root.targetIp = row.model.ip }
@@ -762,12 +770,15 @@ Panel {
                 width: parent.width
                 implicitHeight: Math.max(slider.implicitHeight, track.implicitHeight)
 
-                Caption {
+                Marquee {
                   id: track
                   anchors.left: parent.left
                   anchors.verticalCenter: parent.verticalCenter
                   width: parent.width * 0.5
                   text: [row.model.title, row.model.artist].filter(Boolean).join(" — ") || "Nothing playing"
+                  color: root.dim
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
                 }
 
                 PanelSlider {
