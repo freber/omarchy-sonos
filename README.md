@@ -2,7 +2,7 @@
 
 A fast Sonos bar widget for the Omarchy shell. A speaker icon in the bar opens a compact popup with every room or group: what's playing, play/pause/skip, volume and mute, shuffle and repeat, TV and line-in, room grouping and Spotify search. Media keys control Sonos too.
 
-![The Sonos popup: rooms with playback controls, a grouped room expanded to shuffle, repeat, TV and line-in, per-speaker volume and room chips](preview.png)
+![The Sonos popup: rooms with playback controls, a grouped room expanded to shuffle and repeat, TV and line-in, per-speaker volume and room pills](preview.png)
 
 ## Built for speed
 
@@ -13,6 +13,8 @@ The official Sonos apps feel sluggish. This widget is built to be the opposite:
 - **Always running:** the helper stays alive next to the shell, so a click never waits for anything to start.
 - **No one-second stalls:** speakers on Wi-Fi sometimes drop the first packet of a connection and TCP waits a full second to retry. The helper races a fresh attempt every 150 ms instead.
 - **Live state:** while the popup is open it reads every speaker once a second, so changes from the Sonos app, other people or the buttons on a speaker show up within a second.
+
+![Changes made elsewhere arriving live: a room pauses, shuffle turns off, another room starts, Bedroom joins Kitchen and a volume moves](demo.gif)
 - **Fast search:** the Spotify connection is opened when the popup opens and reused, so results arrive as you type.
 
 ## Install
@@ -37,7 +39,7 @@ The second line removes the Spotify login and the cached speaker addresses and i
 - **Bar icon:** left click opens the popup. Middle click plays/pauses. Scroll changes the volume of the room that's playing.
 - **Rooms:** each group shows an animated spectrum while playing. Long room names and song titles roll so they can be read in full. Click a room's name to make it the one search and media keys control.
 - **Mute:** tap the volume number. It turns into a mute icon until you tap it again.
-- **More per room:** the ⋯ button on a room (the 🔗 badge on a group) expands a room to shuffle and repeat, TV and line-in inputs where the speakers have them, one volume slider per speaker and chips for every room. Tap a room chip to add or remove that room; it pulses until Sonos confirms.
+- **More per room:** the ⋯ button on a room (the 🔗 badge on a group) expands it. Shuffle and repeat sit on the left, TV and line-in on the right where the speakers have them. Below are one volume slider per speaker and a pill for every room: tap a pill to add or remove that room; it pulses until Sonos confirms.
 - **Group all / Ungroup all:** under the rooms. Group all joins every room into the highlighted one.
 - **Media keys:** play/pause, next and previous control the highlighted room through Omarchy's media controls. This needs `python-gobject`, which Omarchy ships.
 - **Errors:** if a speaker refuses something (shuffle on TV input, say) the room shows why for a few seconds in red.

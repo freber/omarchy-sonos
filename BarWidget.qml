@@ -423,40 +423,70 @@ Panel {
     }
   }
 
-  // A rounded toggle used for rooms, play modes and inputs.
-  component Chip: Rectangle {
-    id: chip
+  // Tappable text: accent and bold when selected, dim otherwise. Pulses
+  // while a change waits for the speakers.
+  component TextToggle: Text {
+    id: toggle
     property string label: ""
     property bool selected: false
     property bool pending: false
     signal tapped()
-    width: chipLabel.implicitWidth + Style.space(16)
-    height: chipLabel.implicitHeight + Style.space(6)
-    radius: height / 2
-    color: selected ? Color.accent : "transparent"
-    border.width: 1
-    border.color: selected ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+    text: label
+    textFormat: Text.PlainText
+    color: selected ? Color.accent : root.dim
+    font.family: root.bar.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: selected
+    topPadding: Style.space(2)
+    bottomPadding: Style.space(2)
 
-    Text {
-      id: chipLabel
-      anchors.centerIn: parent
-      text: chip.label
-      textFormat: Text.PlainText
-      color: chip.selected ? root.bar.background : root.bar.foreground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    // Pulses until the speakers confirm the change.
     SequentialAnimation on opacity {
-      running: chip.pending
+      running: toggle.pending
       loops: Animation.Infinite
-      onRunningChanged: if (!running) chip.opacity = 1
+      onRunningChanged: if (!running) toggle.opacity = 1
       NumberAnimation { to: 0.35; duration: 450; easing.type: Easing.InOutSine }
       NumberAnimation { to: 1; duration: 450; easing.type: Easing.InOutSine }
     }
 
-    TapHandler { onTapped: chip.tapped() }
+    HoverHandler { cursorShape: Qt.PointingHandCursor }
+    TapHandler { onTapped: toggle.tapped() }
+  }
+
+  // A small outlined pill for picking rooms; filled when the room is in the group.
+  component Pill: Rectangle {
+    id: pill
+    property string label: ""
+    property bool selected: false
+    property bool pending: false
+    signal tapped()
+    width: pillLabel.implicitWidth + Style.space(10)
+    height: pillLabel.implicitHeight + Style.space(2)
+    radius: height / 2
+    color: selected ? Color.accent : "transparent"
+    border.width: 1
+    border.color: selected ? Color.accent : Qt.darker(root.bar.foreground, 1.8)
+
+    Text {
+      id: pillLabel
+      anchors.centerIn: parent
+      text: pill.label
+      textFormat: Text.PlainText
+      color: pill.selected ? root.bar.background : root.dim
+      font.family: root.bar.fontFamily
+      font.pixelSize: Math.round(Style.font.caption * 0.9)
+    }
+
+    // Pulses until the speakers confirm the join or leave.
+    SequentialAnimation on opacity {
+      running: pill.pending
+      loops: Animation.Infinite
+      onRunningChanged: if (!running) pill.opacity = 1
+      NumberAnimation { to: 0.35; duration: 450; easing.type: Easing.InOutSine }
+      NumberAnimation { to: 1; duration: 450; easing.type: Easing.InOutSine }
+    }
+
+    HoverHandler { cursorShape: Qt.PointingHandCursor }
+    TapHandler { onTapped: pill.tapped() }
   }
 
   component Caption: Text {
@@ -948,42 +978,57 @@ Panel {
                 }
               }
 
-              // ---------- Expanded: play modes and inputs, speaker volumes, grouping chips ----------
-              Flow {
-                id: modes
+              // ---------- Expanded: toolbar, speaker volumes, rooms ----------
+              // Play modes on the left, inputs on the right.
+              Item {
+                id: toolbar
                 readonly property bool fromInput: row.model.source === "tv" || row.model.source === "line-in"
                 readonly property bool shuffle: (root.playModes[row.model.playMode] || [false, ""])[0]
                 readonly property string repeat: (root.playModes[row.model.playMode] || [false, ""])[1]
+                readonly property var inputs: row.expanded ? root.inputsFor(row.model) : []
                 visible: row.expanded
                 width: parent.width
-                spacing: Style.space(6)
-                topPadding: Style.space(4)
+                implicitHeight: Math.max(modeButtons.implicitHeight, inputButtons.implicitHeight)
 
                 // TV and line-in have no queue, so shuffle and repeat only show for music.
-                Chip {
-                  visible: !modes.fromInput
-                  label: root.iconShuffle + " Shuffle"
-                  selected: modes.shuffle
-                  onTapped: root.setPlayMode(row.model, !modes.shuffle, modes.repeat)
-                }
-                Chip {
-                  visible: !modes.fromInput
-                  label: (modes.repeat === "one" ? root.iconRepeatOne : root.iconRepeat)
-                    + (modes.repeat === "one" ? " Repeat one" : " Repeat")
-                  selected: modes.repeat !== ""
-                  onTapped: root.setPlayMode(row.model, modes.shuffle,
-                    modes.repeat === "" ? "all" : modes.repeat === "all" ? "one" : "")
+                Row {
+                  id: modeButtons
+                  visible: !toolbar.fromInput
+                  anchors.left: parent.left
+                  anchors.leftMargin: -Style.space(4)
+
+                  PanelActionButton {
+                    iconText: root.iconShuffle
+                    tooltipText: toolbar.shuffle ? "Shuffle is on" : "Shuffle"
+                    foreground: toolbar.shuffle ? Color.accent : root.dim
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.setPlayMode(row.model, !toolbar.shuffle, toolbar.repeat)
+                  }
+                  PanelActionButton {
+                    iconText: toolbar.repeat === "one" ? root.iconRepeatOne : root.iconRepeat
+                    tooltipText: toolbar.repeat === "" ? "Repeat" : toolbar.repeat === "all" ? "Repeat all" : "Repeat one"
+                    foreground: toolbar.repeat !== "" ? Color.accent : root.dim
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.setPlayMode(row.model, toolbar.shuffle,
+                      toolbar.repeat === "" ? "all" : toolbar.repeat === "all" ? "one" : "")
+                  }
                 }
 
-                Repeater {
-                  model: row.expanded ? root.inputsFor(row.model) : []
+                Row {
+                  id: inputButtons
+                  anchors.right: parent.right
 
-                  Chip {
-                    required property var modelData
-                    label: modelData.kind === "tv" ? root.iconTv + " TV"
-                      : root.iconLineIn + " Line-in" + (row.members > 1 ? " · " + modelData.room.name : "")
-                    selected: row.model.source === modelData.kind
-                    onTapped: root.playInput(row.model, modelData.room, modelData.kind)
+                  Repeater {
+                    model: toolbar.inputs
+
+                    PanelActionButton {
+                      required property var modelData
+                      iconText: modelData.kind === "tv" ? root.iconTv : root.iconLineIn
+                      tooltipText: modelData.kind === "tv" ? "Play the TV" : "Play line-in on " + modelData.room.name
+                      foreground: row.model.source === modelData.kind ? Color.accent : root.dim
+                      fontFamily: root.bar.fontFamily
+                      onClicked: root.playInput(row.model, modelData.room, modelData.kind)
+                    }
                   }
                 }
               }
@@ -1036,20 +1081,20 @@ Panel {
               Flow {
                 visible: row.expanded
                 width: parent.width
-                spacing: Style.space(6)
+                spacing: Style.space(4)
                 topPadding: Style.space(4)
                 bottomPadding: Style.space(4)
 
                 Repeater {
                   model: row.expanded ? roomModel : 0
 
-                  Chip {
-                    id: chip
+                  Pill {
+                    id: roomToggle
                     required property var model
                     label: model.name
                     selected: model.group === row.model.ip
                     pending: model.ip in root.pendingGroups && !root.pendingGroups[model.ip].quiet
-                    onTapped: root.toggleMember(chip.model, row.model)
+                    onTapped: root.toggleMember(roomToggle.model, row.model)
                   }
                 }
               }
@@ -1058,15 +1103,15 @@ Panel {
 
           Row {
             visible: root.query === "" && root.rooms.length > 1
-            spacing: Style.space(6)
+            spacing: Style.space(14)
 
-            Chip {
+            TextToggle {
               visible: root.groups.length > 1
               label: root.iconLink + " Group all"
               onTapped: root.regroupAll(true)
             }
 
-            Chip {
+            TextToggle {
               visible: root.groups.length < root.rooms.length
               label: "Ungroup all"
               onTapped: root.regroupAll(false)
