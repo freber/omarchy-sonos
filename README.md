@@ -2,7 +2,7 @@
 
 A fast Sonos bar widget for the Omarchy shell. A speaker icon in the bar opens a compact popup with every room or group: what's playing, play/pause/skip, volume and mute, shuffle and repeat, TV and line-in, room grouping and Spotify search. Media keys control Sonos too.
 
-![The Sonos popup: rooms with playback controls, a grouped room expanded to shuffle and repeat, TV and line-in, per-speaker volume and room pills](preview.png)
+<img src="demo.gif" width="341" alt="The Sonos popup updating live as changes are made elsewhere: a room pauses, shuffle turns off, another room starts, Bedroom joins Kitchen and a volume moves">
 
 ## Built for speed
 
@@ -13,8 +13,6 @@ The official Sonos apps feel sluggish. This widget is built to be the opposite:
 - **Always running:** the helper stays alive next to the shell, so a click never waits for anything to start.
 - **No one-second stalls:** speakers on Wi-Fi sometimes drop the first packet of a connection and TCP waits a full second to retry. The helper races a fresh attempt every 150 ms instead.
 - **Live state:** while the popup is open it reads every speaker once a second, so changes from the Sonos app, other people or the buttons on a speaker show up within a second.
-
-![Changes made elsewhere arriving live: a room pauses, shuffle turns off, another room starts, Bedroom joins Kitchen and a volume moves](demo.gif)
 - **Fast search:** the Spotify connection is opened when the popup opens and reused, so results arrive as you type.
 
 ## Install
