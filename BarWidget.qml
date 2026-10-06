@@ -428,7 +428,7 @@ Panel {
         Column {
           id: content
           width: scrollArea.availableWidth
-          spacing: Style.space(10)
+          spacing: Style.space(8)
 
           // ---------- Spotify not set up: connect card instead of search ----------
           Column {
@@ -642,7 +642,7 @@ Panel {
               readonly property bool expanded: root.groupEdit === model.ip
               readonly property int members: root.memberCount(model.ip)
               width: content.width
-              spacing: Style.space(2)
+              spacing: 0
 
               Item {
                 width: parent.width
@@ -757,18 +757,23 @@ Panel {
                 }
               }
 
-              Caption {
-                width: parent.width
-                text: [row.model.title, row.model.artist].filter(Boolean).join(" — ") || "Nothing playing"
-              }
-
+              // What's playing and the group volume share one line.
               Item {
                 width: parent.width
-                implicitHeight: slider.implicitHeight
+                implicitHeight: Math.max(slider.implicitHeight, track.implicitHeight)
+
+                Caption {
+                  id: track
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width * 0.5
+                  text: [row.model.title, row.model.artist].filter(Boolean).join(" — ") || "Nothing playing"
+                }
 
                 PanelSlider {
                   id: slider
-                  anchors.left: parent.left
+                  anchors.left: track.right
+                  anchors.leftMargin: Style.space(8)
                   anchors.right: percent.left
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
@@ -805,7 +810,7 @@ Panel {
                   Caption {
                     id: speakerName
                     x: Style.space(12)
-                    width: row.width * 0.32
+                    width: row.width * 0.5 - Style.space(12)
                     anchors.verticalCenter: parent.verticalCenter
                     text: speaker.model.name
                   }
