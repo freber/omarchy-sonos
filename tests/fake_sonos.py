@@ -43,6 +43,7 @@ class Household:
         self.log = []            # (ip, action, args) in arrival order
         self.refuse = {}         # (ip, action) -> UPnP error code
         self.delay = {}          # ip -> seconds before answering
+        self.ignore = set()      # (ip, action) answered as done but without effect
         self.servers = []
         for ip, name, inputs, volume, coord, playing in rooms:
             sp = Speaker(ip, name, inputs, volume)
@@ -167,7 +168,7 @@ class Household:
             for s in self.members(ip):
                 s.group = heir.ip
             heir.state, heir.title, heir.artist, heir.uri = sp.state, sp.title, sp.artist, sp.uri
-            sp.group, sp.state = sp.ip, "STOPPED"
+            sp.group, sp.state = (heir.ip if arg("RejoinGroup") in ("1", "true") else sp.ip), "STOPPED"
             return {}
         if action == "RemoveAllTracksFromQueue":
             sp.queue = []
@@ -213,7 +214,7 @@ class Household:
                     try:
                         if (ip, action) in household.refuse:
                             raise Refused(household.refuse[(ip, action)])
-                        out = household.act(ip, action, body)
+                        out = {} if (ip, action) in household.ignore else household.act(ip, action, body)
                         inner = "".join(f"<{k}>{html.escape(str(v))}</{k}>" for k, v in out.items())
                         xml = (f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
                                f'<u:{action}Response xmlns:u="x">{inner}</u:{action}Response></s:Body></s:Envelope>')

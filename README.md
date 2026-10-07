@@ -35,13 +35,16 @@ The second line removes the Spotify login and the cached speaker addresses and i
 ## Use
 
 - **Bar icon:** left click opens the popup. Middle click plays/pauses. Scroll changes the volume of the room that's playing.
-- **Rooms:** each group shows an animated spectrum while playing. Long room names and song titles roll so they can be read in full. Click a room's name to make it the one search and media keys control.
+- **Rooms:** each group shows an animated spectrum while playing. Long room names and song titles scroll round once, like a departure board, when the popup opens, and again while you hover over them. Click a room's name to make it the one search and media keys control.
+- **Volume:** drag the slider, or use − and + beside it to step by one.
 - **Mute:** tap the volume number. It turns into a mute icon until you tap it again.
-- **More per room:** the ⋯ button on a room (the 🔗 badge on a group) expands it. Shuffle and repeat sit on the left, TV and line-in on the right where the speakers have them. Below are one volume slider per speaker and a pill for every room: tap a pill to add or remove that room; it pulses until Sonos confirms.
+- **More per room:** the ⋯ button on a room (the 🔗 badge on a group) expands it. Shuffle and repeat sit on the left, TV and line-in on the right where the speakers have them. Below is a pill for every room: tap a pill to add or remove that room; it pulses until Sonos confirms.
+- **Speakers in a group:** "▸ 3 speakers" under a grouped room opens one row per speaker with its own slider and − / +. The crown shows which speaker leads the group; click another speaker's crown to hand the group to it without stopping the music.
 - **Group all / Ungroup all:** under the rooms. Group all joins every room into the highlighted one.
 - **Media keys:** play/pause, next and previous control the highlighted room through Omarchy's media controls. This needs `python-gobject`, which Omarchy ships.
 - **Errors:** if a speaker refuses something (shuffle on TV input, say) the room shows why for a few seconds in red.
 - **Search:** type in the search field, pick where it plays with the "Play in" chips, then `enter` or click a result. `esc` clears, then closes.
+- **Playlists:** the button next to the search field lists your Spotify playlists; click one to play it. Typing searches instead.
 
 ## Spotify search
 
@@ -59,11 +62,12 @@ The Spotify region (Europe or US) is read from your speakers. If playing from se
 ## Troubleshooting
 
 - **No speakers found:** discovery uses SSDP with a subnet scan as fallback. If your speakers are on another VLAN, set their IP on the widget's entry in `~/.config/omarchy/shell.json`: `{ "id": "freber.sonos", "hosts": "192.168.1.20" }`.
+- **Rooms look wrong or out of date:** a speaker behind a Wi-Fi extender can lose sight of the others and report stale groups. Put a speaker on the main network first in `hosts` so the widget asks that one.
 - **`redirect_uri: Not matching configuration`:** the redirect URI in your Spotify app must be exactly `http://127.0.0.1:8888/callback`. Save the app settings after adding it.
 
 ## How it works
 
-`sonos` is a small Python helper (standard library only) that speaks UPnP to the speakers. The widget runs it as `sonos serve`, a long-running process that takes commands and returns status as JSON lines; it exits with the shell. Speaker addresses are cached in `~/.cache/omasonos.json`, so a full status update is one parallel round trip to every speaker. Volume changes go out one at a time per speaker with the newest value, so dragging a slider never lands out of order.
+`sonos` is a small Python helper (standard library only) that speaks UPnP to the speakers. The widget runs it as `sonos serve`, a long-running process that takes commands and returns status as JSON lines; it exits with the shell. Speaker addresses are cached in `~/.cache/omasonos.json`, so a full status update is one parallel round trip to every speaker. Volume changes go out one at a time per speaker with the newest value, so dragging a slider never lands out of order. A group's volume is set speaker by speaker, scaled like the Sonos app does, because some coordinators (for example one behind a Wi-Fi extender) accept a group volume and change nothing.
 
 `serve` also shows the highlighted room as a desktop media player (MPRIS) named "Sonos · room".
 
