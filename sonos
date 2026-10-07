@@ -3,9 +3,11 @@
 
   sonos [--hosts ip,ip] serve           long-running mode for the widget: JSON lines in and out
   sonos [--hosts ip,ip] status          JSON for every group
+  sonos playlists                       JSON for your Spotify playlists
   sonos play|pause|next|prev <ip>       transport control on a group coordinator
   sonos volume <ip> <0-100>             group volume
   sonos speaker-volume <ip> <0-100>     volume of one speaker inside a group
+  sonos lead <group ip> <speaker uuid>  make another speaker lead the group
   sonos mute <ip> on|off                mute a group
   sonos play-mode <ip> <mode>           NORMAL, REPEAT_ALL, REPEAT_ONE, SHUFFLE_NOREPEAT,
                                         SHUFFLE or SHUFFLE_REPEAT_ONE
@@ -606,6 +608,31 @@ def search(query, api=None):
     return results
 
 
+
+# Asked for instead of a search when the widget opens its playlist list.
+MY_PLAYLISTS = ":playlists"
+
+
+def my_playlists(api=None):
+    """The user's own and followed playlists, as many as Spotify returns in four pages."""
+    api = api or SpotifyApi()
+    results, path = [], "/v1/me/playlists?limit=50"
+    for _ in range(4):
+        data = api.get(path)
+        for p in filter(None, data.get("items", [])):
+            images = p.get("images") or []
+            # Spotify renamed a playlist's "tracks" to "items" in Feb 2026.
+            total = (p.get("items") or p.get("tracks") or {}).get("total")
+            count = f"{total} song{'' if total == 1 else 's'}" if isinstance(total, int) else ""
+            results.append({"uri": p["uri"], "title": p["name"],
+                            "subtitle": " · ".join(filter(None, ["Playlist", count])),
+                            "art": images[-1]["url"] if images else ""})
+        nxt = data.get("next")
+        if not nxt:
+            break
+        path = nxt.split("api.spotify.com", 1)[-1]
+    return results
+
 # Sonos-side identifiers for Spotify items, as the Sonos app builds them.
 SPOTIFY_ITEMS = {
     "track": ("", "00032020", "object.item.audioItem.musicTrack"),
@@ -653,7 +680,7 @@ def play_uri(ip, uri, uuid=None, service=None):
     soap(ip, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
 
 
-CONTROLS = ("play", "pause", "next", "prev", "join", "leave", "volume", "speaker-volume",
+CONTROLS = ("play", "pause", "next", "prev", "join", "leave", "lead", "volume", "speaker-volume",
             "mute", "play-mode", "source")
 PLAY_MODES = ("NORMAL", "REPEAT_ALL", "REPEAT_ONE", "SHUFFLE_NOREPEAT", "SHUFFLE", "SHUFFLE_REPEAT_ONE")
 MODE_PARTS = {"NORMAL": (False, ""), "REPEAT_ALL": (False, "all"), "REPEAT_ONE": (False, "one"),
@@ -827,6 +854,14 @@ def control(cmd, ip, arg=None, extra=None):
         action = {"play": "Play", "pause": "Pause", "next": "Next", "prev": "Previous"}[cmd]
         extra = "<Speed>1</Speed>" if cmd == "play" else ""
         soap(ip, "AVTransport", action, f"<InstanceID>0</InstanceID>{extra}", spare=True)
+    elif cmd == "lead":
+        # Hand the group to another member without stopping what plays. The speaker
+        # only answers once the handover is done (often > TIMEOUT); the next status shows it.
+        try:
+            soap(ip, "AVTransport", "DelegateGroupCoordinationTo",
+                 f"<InstanceID>0</InstanceID><NewCoordinator>{escape(arg)}</NewCoordinator><RejoinGroup>1</RejoinGroup>")
+        except TimeoutError:
+            pass
     elif cmd == "join":
         soap(ip, "AVTransport", "SetAVTransportURI",
              f"<InstanceID>0</InstanceID><CurrentURI>x-rincon:{escape(arg)}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>", spare=True)
@@ -987,6 +1022,22 @@ class Server:
             self.begin()
             self.pool.submit(self.volume_worker, key)
 
+    def set_group_volume(self, ip, level):
+        """Scale each speaker in the group from the last status, as the Sonos app does.
+        Some coordinators (e.g. one behind a Wi-Fi extender) accept SetGroupVolume and
+        change nothing, so the group volume is only used when the members are unknown."""
+        level = max(0, min(100, level))
+        with self.lock:
+            group = next((g for g in self.data["groups"] if g["ip"] == ip), None)
+            members = [(r["ip"], r.get("volume", 0)) for r in self.data["rooms"] if r.get("group") == ip]
+        if not group or not members:
+            self.set_volume("volume", ip, level)
+            return
+        base = group.get("volume", 0)
+        for member, volume in members:
+            scaled = volume * level / base if base > 0 else level
+            self.set_volume("speaker-volume", member, max(0, min(100, round(scaled))))
+
     def volume_worker(self, key):
         sent = None
         while True:
@@ -1014,7 +1065,8 @@ class Server:
         while True:
             query = self.query
             try:
-                out = {"type": "search", "query": query, "results": search(query, self.spotify)}
+                found = my_playlists(self.spotify) if query == MY_PLAYLISTS else search(query, self.spotify)
+                out = {"type": "search", "query": query, "results": found}
             except Exception as e:
                 out = {"type": "search", "query": query, "error": str(e)}
             with self.lock:
@@ -1046,12 +1098,14 @@ class Server:
         elif cmd == "refresh":
             self.force = True
             self.wake.set()
-        elif cmd in ("volume", "speaker-volume"):
+        elif cmd == "volume":
+            self.set_group_volume(ip, int(msg["value"]))
+        elif cmd == "speaker-volume":
             self.set_volume(cmd, ip, int(msg["value"]))
         elif cmd in CONTROLS:
             self.begin()
             # Track changes take a moment to show up, so look twice.
-            confirm = (0.25, 1.0) if cmd in ("play", "next", "prev", "source") else (0.25,)
+            confirm = (0.25, 1.0) if cmd in ("play", "next", "prev", "source", "lead") else (0.25,)
             self.pool.submit(self.run_control, cmd, ip, msg.get("arg"), msg.get("extra"), confirm)
         elif cmd in ("group-all", "ungroup-all"):
             self.regroup(cmd, ip)
@@ -1155,6 +1209,8 @@ def main(argv):
         Server(manual).run()
     elif cmd == "search":
         print(json.dumps({"results": search(" ".join(argv[1:]))}))
+    elif cmd == "playlists":
+        print(json.dumps({"results": my_playlists()}))
     elif cmd == "spotify-status":
         try:
             conf = spotify_conf()

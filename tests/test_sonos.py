@@ -108,6 +108,32 @@ class OneShotTest(HelperTest):
         self.run_helper("speaker-volume", "127.0.0.3", "150")
         self.assertEqual(self.home.speakers["127.0.0.3"].volume, 100)  # clamped
 
+    def test_lead_hands_the_group_over_and_stays_in_it(self):
+        living, patio = self.home.speakers["127.0.0.2"], self.home.speakers["127.0.0.3"]
+        code, _ = self.run_helper("lead", "127.0.0.2", patio.uuid)
+        self.assertEqual(code, 0)
+        self.assertEqual((patio.group, living.group, patio.title), ("127.0.0.3", "127.0.0.3", "Song B"))
+
+    def test_my_playlists_reads_every_page(self):
+        pages = {
+            "/v1/me/playlists?limit=50": {"items": [
+                {"uri": "spotify:playlist:a", "name": "Mix", "images": [{"url": "big"}, {"url": "small"}],
+                 "items": {"total": 12}},
+                None,  # Spotify sends null for playlists it can no longer show
+                {"uri": "spotify:playlist:b", "name": "Old", "images": [], "tracks": {"total": 1}}],
+                "next": "https://api.spotify.com/v1/me/playlists?offset=50&limit=50"},
+            "/v1/me/playlists?offset=50&limit=50": {"items": [
+                {"uri": "spotify:playlist:c", "name": "Empty", "images": None}], "next": None},
+        }
+
+        class Api:
+            def get(self, path):
+                return pages[path]
+
+        found = self.sonos.my_playlists(Api())
+        self.assertEqual([(p["title"], p["subtitle"], p["art"]) for p in found], [
+            ("Mix", "Playlist · 12 songs", "small"), ("Old", "Playlist · 1 song", ""), ("Empty", "Playlist", "")])
+
     def test_mute_and_play_mode(self):
         self.run_helper("mute", "127.0.0.1", "on")
         self.run_helper("play-mode", "127.0.0.1", "SHUFFLE")
@@ -286,6 +312,17 @@ class ServeTest(HelperTest):
         sent = [int(body.split("<DesiredVolume>")[1].split("<")[0]) for _, _, body in self.home.actions("SetVolume")]
         self.assertEqual(sent[-1], 42)
         self.assertLess(len(sent), 18)  # levels were combined, not all sent
+
+    def test_group_volume_sets_each_speaker(self):
+        # Some coordinators accept SetGroupVolume and change nothing.
+        self.watch()
+        self.home.ignore.add(("127.0.0.2", "SetGroupVolume"))
+        self.send(cmd="volume", ip="127.0.0.2", value=60)  # group is 30: Living Room 40, Patio 20
+        deadline = time.monotonic() + 5
+        speakers = lambda: (self.home.speakers["127.0.0.2"].volume, self.home.speakers["127.0.0.3"].volume)
+        while speakers() != (80, 40) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(speakers(), (80, 40))
 
     def test_failure_is_reported(self):
         self.watch()

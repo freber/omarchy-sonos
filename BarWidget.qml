@@ -18,10 +18,17 @@ Panel {
   readonly property string helper: Qt.resolvedUrl("sonos").toString().replace(/^file:\/\//, "")
   readonly property var baseCommand: setting("hosts", "") !== ""
     ? [helper, "--hosts", String(setting("hosts", ""))] : [helper]
+  // Settings can arrive after the helper has started; restart it so it uses them.
+  // A stop before the process is fully up never reports onExited, so restart explicitly.
+  onBaseCommandChanged: {
+    helperProc.running = false
+    restartHelper.restart()
+  }
 
   property var groups: []
   property var rooms: []              // every speaker, with the coordinator ip of its group
   property string groupEdit: ""       // group that is expanded to speakers and chips
+  property var openSpeakers: ({})     // group ip -> true while its speaker volumes are shown
   property var pendingGroups: ({})    // room ip -> { group, until, alone, quiet } for joins/leaves in flight
   property bool loaded: false
   property string error: ""
@@ -30,6 +37,10 @@ Panel {
   property var volumeBaseline: null   // group and speaker volumes when a group drag began
 
   property string query: ""
+  property bool showPlaylists: false   // the results list shows your Spotify playlists
+  // Typing searches; with the box empty the playlist button lists your playlists.
+  readonly property string listQuery: query.trim() !== "" ? query : (showPlaylists ? ":playlists" : "")
+  readonly property bool listing: listQuery !== ""
   property var results: []
   property string searchError: ""
   property int selectedResult: 0
@@ -69,6 +80,8 @@ Panel {
   readonly property string iconTv: glyph(0xF0502)
   readonly property string iconLineIn: glyph(0xF06A5)
   readonly property string iconMore: glyph(0xF01D8)
+  readonly property string iconPlaylist: glyph(0xF0CB8)
+  readonly property string iconLead: glyph(0xF01A5)
 
   // Sonos play modes as shuffle on/off plus repeat "", "all" or "one".
   readonly property var playModes: ({
@@ -185,6 +198,18 @@ Panel {
     request({ cmd: playing ? "pause" : "play", ip: group.ip })
   }
 
+  // The speaker that leads a group handles its queue and playback.
+  function toggleSpeakers(ip) {
+    var next = Object.assign({}, openSpeakers)
+    if (next[ip]) delete next[ip]; else next[ip] = true
+    openSpeakers = next
+  }
+
+  function makeLead(group, room) {
+    if (!group || !room || room.ip === group.ip || !room.uuid) return
+    request({ cmd: "lead", ip: group.ip, arg: room.uuid })
+  }
+
   function skip(group, direction) {
     if (!group) return
     request({ cmd: direction > 0 ? "next" : "prev", ip: group.ip })
@@ -298,13 +323,19 @@ Panel {
       volumeBaseline = { ip: group.ip, volume: group.volume || 0, speakers: speakers }
     }
     var base = volumeBaseline
+    var levels = {}
     rooms = rooms.map(function(r) {
       if (!(r.ip in base.speakers)) return r
       var v = base.volume > 0 ? base.speakers[r.ip] * volume / base.volume : volume
-      return Object.assign({}, r, { volume: Math.max(0, Math.min(100, Math.round(v))) })
+      levels[r.ip] = Math.max(0, Math.min(100, Math.round(v)))
+      return Object.assign({}, r, { volume: levels[r.ip] })
     })
     patch(group.ip, { volume: volume })
-    queueVolume("volume", group.ip, volume)
+    // Set each speaker rather than asking the coordinator for a group volume:
+    // a coordinator behind a Wi-Fi extender can accept SetGroupVolume and do nothing.
+    var ips = Object.keys(levels)
+    if (ips.length === 0) queueVolume("volume", group.ip, volume)
+    for (var k = 0; k < ips.length; k++) queueVolume("speaker-volume", ips[k], levels[ips[k]])
   }
 
   function setRoomVolume(room, volume) {
@@ -320,14 +351,15 @@ Panel {
   }
 
   function runSearch() {
-    if (query.trim() === "") { results = []; searchError = ""; return }
-    request({ cmd: "search", query: query })
+    if (listQuery === "") { results = []; searchError = ""; return }
+    request({ cmd: "search", query: listQuery })
   }
 
   function applySearch(data) {
-    if (data.query !== query) return   // the helper answers the newest query too
+    if (data.query !== listQuery) return   // the helper answers the newest query too
     results = data.results || []
-    searchError = data.error || (results.length === 0 ? "No results" : "")
+    searchError = data.error || (results.length === 0
+      ? (data.query === ":playlists" ? "No playlists in your Spotify library" : "No results") : "")
     if (data.error && /log in/i.test(data.error)) spotifyReady = false
     selectedResult = 0
   }
@@ -337,12 +369,14 @@ Panel {
     if (!result || !group) return
     patch(group.ip, { state: "PLAYING", title: result.title, artist: result.subtitle })
     request({ cmd: "play-uri", ip: group.ip, uri: result.uri })
+    showPlaylists = false
     searchField.text = ""
   }
 
   function logoutSpotify() {
     Quickshell.execDetached([helper, "spotify-logout"])
     searchField.text = ""
+    showPlaylists = false
     results = []
     spotifyReady = false
     connectError = ""
@@ -361,7 +395,7 @@ Panel {
 
   onOpenedChanged: {
     watch()
-    if (!opened) return
+    if (!opened) { showPlaylists = false; return }
     if (spotifyReady) searchField.selectAll()
     else if (!spotifyStatusProc.running) spotifyStatusProc.running = true
   }
@@ -397,6 +431,9 @@ Panel {
   }
 
   // Text that rolls back and forth while the popup is open when it doesn't fit.
+  // Text that doesn't fit runs right to left and comes round again, like a
+  // departure board: a second copy follows the first after a gap. It runs one
+  // lap when the popup opens (or the text changes), then again while hovered.
   component Marquee: Item {
     id: marquee
     property alias text: label.text
@@ -404,22 +441,55 @@ Panel {
     property alias font: label.font
     readonly property real textWidth: label.implicitWidth
     readonly property real overflow: Math.max(0, label.implicitWidth - width)
+    readonly property real gap: Style.space(48)
+    readonly property real lap: label.implicitWidth + gap
+    property bool played: false        // the opening lap has run
     implicitHeight: label.implicitHeight
     clip: overflow > 0
 
-    Text {
-      id: label
-      textFormat: Text.PlainText
+    function run() {
+      if (root.opened && overflow > 0 && !ticker.running) { played = true; ticker.start() }
+    }
+    function reset() { ticker.stop(); strip.x = 0; played = false }
 
-      SequentialAnimation on x {
-        running: root.opened && marquee.overflow > 0
-        loops: Animation.Infinite
-        onRunningChanged: if (!running) label.x = 0
-        PauseAnimation { duration: 1500 }
-        NumberAnimation { to: -marquee.overflow; duration: marquee.overflow * 30; easing.type: Easing.InOutSine }
-        PauseAnimation { duration: 1200 }
-        NumberAnimation { to: 0; duration: marquee.overflow * 30; easing.type: Easing.InOutSine }
+    onOverflowChanged: if (overflow > 0 && !played) run(); else if (overflow <= 0) reset()
+    Connections {
+      target: root
+      function onOpenedChanged() { if (root.opened) marquee.run(); else marquee.reset() }
+    }
+
+    HoverHandler {
+      id: hover
+      onHoveredChanged: if (hovered) marquee.run()
+    }
+
+    Row {
+      id: strip
+      spacing: marquee.gap
+
+      Text {
+        id: label
+        textFormat: Text.PlainText
+        onTextChanged: { marquee.reset(); marquee.run() }
       }
+      Text {
+        visible: marquee.overflow > 0
+        text: label.text
+        textFormat: Text.PlainText
+        color: label.color
+        font: label.font
+      }
+    }
+
+    NumberAnimation {
+      id: ticker
+      target: strip
+      property: "x"
+      from: 0
+      to: -marquee.lap
+      duration: marquee.lap * 25   // about 40 px a second
+      // The copy now sits where the text started, so snapping back is invisible.
+      onFinished: { strip.x = 0; if (hover.hovered) marquee.run() }
     }
   }
 
@@ -593,7 +663,8 @@ Panel {
       anchors.fill: parent
       // The search field has focus and consumes typing; only keys it leaves
       // alone (Esc, Tab, Up/Down) arrive here.
-      onCloseRequested: root.query !== "" ? searchField.text = "" : root.close()
+      onCloseRequested: root.query !== "" ? searchField.text = ""
+        : root.showPlaylists ? root.showPlaylists = false : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
         if (dy !== 0 && root.results.length > 0)
@@ -703,11 +774,25 @@ Panel {
 
             TextField {
               id: searchField
-              width: parent.width - logoutButton.width - Style.space(6)
+              width: parent.width - playlistButton.width - logoutButton.width - Style.space(12)
               foreground: root.bar.foreground
               placeholderText: root.targetGroup ? "Spotify · plays in " + root.targetGroup.name : "Search Spotify"
               onTextChanged: { root.query = text; searchDebounce.restart() }
               onAccepted: root.playResult(root.results[root.selectedResult])
+            }
+
+            PanelActionButton {
+              id: playlistButton
+              anchors.verticalCenter: searchField.verticalCenter
+              iconText: root.iconPlaylist
+              tooltipText: root.showPlaylists ? "Hide your playlists" : "Your playlists"
+              foreground: root.showPlaylists ? Color.accent : root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              onClicked: {
+                root.showPlaylists = !root.showPlaylists
+                root.selectedResult = 0
+                root.runSearch()
+              }
             }
 
             PanelActionButton {
@@ -722,7 +807,7 @@ Panel {
           }
 
           Caption {
-            visible: root.query !== "" && root.searchError !== ""
+            visible: root.listing && root.searchError !== ""
             width: parent.width
             wrapMode: Text.Wrap
             text: root.searchError
@@ -730,7 +815,7 @@ Panel {
 
           // ---------- Where results play ----------
           Flow {
-            visible: root.query !== "" && root.groups.length > 1
+            visible: root.listing && root.groups.length > 1
             width: parent.width
             spacing: Style.space(6)
 
@@ -741,7 +826,7 @@ Panel {
             }
 
             Repeater {
-              model: root.query !== "" ? groupModel : 0
+              model: root.listing ? groupModel : 0
 
               Rectangle {
                 id: target
@@ -773,7 +858,7 @@ Panel {
 
           // ---------- Search results ----------
           Column {
-            visible: root.query !== ""
+            visible: root.listing
             width: parent.width
 
             Repeater {
@@ -814,13 +899,13 @@ Panel {
           }
 
           Caption {
-            visible: root.query === "" && root.groups.length === 0
+            visible: !root.listing && root.groups.length === 0
             text: root.loaded ? root.error : "Looking for speakers…"
           }
 
           // ---------- Groups ----------
           Repeater {
-            model: root.query === "" ? groupModel : 0
+            model: !root.listing ? groupModel : 0
 
             Column {
               id: row
@@ -828,6 +913,7 @@ Panel {
               readonly property bool playing: model.state === "PLAYING"
               readonly property bool expanded: root.groupEdit === model.ip
               readonly property int members: root.memberCount(model.ip)
+              readonly property bool speakersOpen: !!root.openSpeakers[model.ip]
               width: content.width
               spacing: 0
 
@@ -945,12 +1031,25 @@ Panel {
                   font.pixelSize: Style.font.caption
                 }
 
+                // Step the group volume by one.
+                PanelActionButton {
+                  id: volDown
+                  anchors.left: track.right
+                  anchors.leftMargin: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "−"
+                  tooltipText: "Volume down 1"
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  onClicked: root.setVolume(row.model, (row.model.volume || 0) - 1)
+                }
+
                 PanelSlider {
                   id: slider
-                  anchors.left: track.right
-                  anchors.leftMargin: Style.space(8)
-                  anchors.right: percent.left
-                  anchors.rightMargin: Style.space(8)
+                  anchors.left: volDown.right
+                  anchors.leftMargin: Style.space(4)
+                  anchors.right: volUp.left
+                  anchors.rightMargin: Style.space(4)
                   anchors.verticalCenter: parent.verticalCenter
                   bar: root.bar
                   maximum: 100
@@ -960,6 +1059,18 @@ Panel {
                   opacity: row.model.muted ? 0.4 : 1
                   onMoved: function(v) { root.setVolume(row.model, v) }
                   onReleased: function(v) { root.setVolume(row.model, v) }
+                }
+
+                PanelActionButton {
+                  id: volUp
+                  anchors.right: percent.left
+                  anchors.rightMargin: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "+"
+                  tooltipText: "Volume up 1"
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  onClicked: root.setVolume(row.model, (row.model.volume || 0) + 1)
                 }
 
                 // The number doubles as the mute button.
@@ -1033,30 +1144,70 @@ Panel {
                 }
               }
 
+              // Grouped rooms: a line that opens each speaker's volume.
+              Text {
+                visible: row.members > 1
+                text: (row.speakersOpen ? "▾ " : "▸ ") + row.members + " speakers"
+                textFormat: Text.PlainText
+                color: row.speakersOpen ? Color.accent : root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                topPadding: Style.space(2)
+                bottomPadding: Style.space(2)
+
+                HoverHandler { cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: root.toggleSpeakers(row.model.ip) }
+              }
+
               Repeater {
-                model: row.expanded && row.members > 1 ? roomModel : 0
+                model: row.members > 1 && row.speakersOpen ? roomModel : 0
 
                 Item {
                   id: speaker
                   required property var model
                   visible: model.group === row.model.ip
                   width: row.width
-                  implicitHeight: visible ? speakerSlider.implicitHeight : 0
+                  implicitHeight: visible ? Math.max(speakerSlider.implicitHeight, speakerUp.implicitHeight) : 0
+
+                  PanelActionButton {
+                    id: leadButton
+                    readonly property bool leads: speaker.model.ip === row.model.ip
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: root.iconLead
+                    tooltipText: leads ? speaker.model.name + " leads this group" : "Make " + speaker.model.name + " the lead"
+                    foreground: leads ? Color.accent : root.dim
+                    fontFamily: root.bar.fontFamily
+                    onClicked: if (!leads) root.makeLead(row.model, speaker.model)
+                  }
 
                   Caption {
                     id: speakerName
-                    x: Style.space(12)
-                    width: row.width * 0.5 - Style.space(12)
+                    anchors.left: leadButton.right
+                    anchors.leftMargin: Style.space(2)
+                    width: row.width * 0.5 - leadButton.width - Style.space(2)
                     anchors.verticalCenter: parent.verticalCenter
                     text: speaker.model.name
                   }
 
+                  PanelActionButton {
+                    id: speakerDown
+                    anchors.left: speakerName.right
+                    anchors.leftMargin: Style.space(4)
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: "−"
+                    tooltipText: speaker.model.name + " down 1"
+                    foreground: root.bar.foreground
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.setRoomVolume(speaker.model, (speaker.model.volume || 0) - 1)
+                  }
+
                   PanelSlider {
                     id: speakerSlider
-                    anchors.left: speakerName.right
-                    anchors.leftMargin: Style.space(8)
-                    anchors.right: speakerPercent.left
-                    anchors.rightMargin: Style.space(8)
+                    anchors.left: speakerDown.right
+                    anchors.leftMargin: Style.space(4)
+                    anchors.right: speakerUp.left
+                    anchors.rightMargin: Style.space(4)
                     anchors.verticalCenter: parent.verticalCenter
                     bar: root.bar
                     maximum: 100
@@ -1065,6 +1216,18 @@ Panel {
                     value: speaker.model.volume || 0
                     onMoved: function(v) { root.setRoomVolume(speaker.model, v) }
                     onReleased: function(v) { root.setRoomVolume(speaker.model, v) }
+                  }
+
+                  PanelActionButton {
+                    id: speakerUp
+                    anchors.right: speakerPercent.left
+                    anchors.rightMargin: Style.space(4)
+                    anchors.verticalCenter: parent.verticalCenter
+                    iconText: "+"
+                    tooltipText: speaker.model.name + " up 1"
+                    foreground: root.bar.foreground
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.setRoomVolume(speaker.model, (speaker.model.volume || 0) + 1)
                   }
 
                   Caption {
@@ -1102,7 +1265,7 @@ Panel {
           }
 
           Row {
-            visible: root.query === "" && root.rooms.length > 1
+            visible: !root.listing && root.rooms.length > 1
             spacing: Style.space(14)
 
             TextToggle {
